@@ -160,6 +160,194 @@ RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::u
     return out;
 }
 
+void validate_row_ranges(const TensorSlice& slice, std::uint64_t rows) {
+    if (slice.used_row_ranges() == 0) {
+        throw ArtifactError("tensor row slice selects no rows");
+    }
+    std::uint64_t cursor = 0;
+    for (const TensorSliceRange& range : slice.rows) {
+        if (range.count == 0) { break; }
+        if (range.begin < cursor) {
+            throw ArtifactError("tensor row slice ranges overlap or are out of order");
+        }
+        if (range.begin > rows || range.count > rows - range.begin) {
+            throw ArtifactError("tensor row slice range is outside the stored shape");
+        }
+        cursor = range.begin + range.count;
+    }
+}
+
+void validate_column_ranges(const TensorSlice& slice, std::uint64_t columns) {
+    if (slice.used_column_ranges() == 0) {
+        throw ArtifactError("tensor column slice selects no columns");
+    }
+    std::uint64_t cursor = 0;
+    for (const TensorSliceRange& range : slice.column_ranges) {
+        if (range.count == 0) { break; }
+        if (range.begin < cursor) {
+            throw ArtifactError("tensor column slice ranges overlap or are out of order");
+        }
+        if (range.begin > columns || range.count > columns - range.begin) {
+            throw ArtifactError("tensor column slice range is outside the stored shape");
+        }
+        cursor = range.begin + range.count;
+    }
+}
+
+std::uint64_t contiguous_row_bytes(std::span<const std::uint64_t> shape) {
+    std::uint64_t elements = 1;
+    for (std::size_t dim = 1; dim < shape.size(); ++dim) {
+        elements = checked_mul(elements, shape[dim], "tensor row element count");
+    }
+    return elements;
+}
+
+std::uint64_t sliced_tensor_encoded_size(const TensorSlice& slice, StorageLayout layout,
+                                         NumericFormat format,
+                                         std::span<const std::uint64_t> shape) {
+    if (shape.empty()) { throw ArtifactError("tensor slice requires a positive shape"); }
+    switch (slice.kind) {
+    case TensorSliceKind::Whole:
+        return tensor_encoded_size(layout, format, shape);
+    case TensorSliceKind::Rows:
+        validate_row_ranges(slice, shape[0]);
+        if (layout == StorageLayout::ContiguousLeV1) {
+            const auto row_bytes = checked_mul(contiguous_row_bytes(shape),
+                                               direct_word_bytes(format), "tensor row bytes");
+            return checked_mul(slice.row_count(), row_bytes, "sliced tensor encoded size");
+        }
+        if (layout == StorageLayout::RowSplitK128V1) {
+            const std::array<std::uint64_t, 2> sliced = {slice.row_count(), shape[1]};
+            return row_split_geometry(format, sliced).encoded_bytes;
+        }
+        break;
+    case TensorSliceKind::Columns:
+        if (shape.size() != 2 || slice.column_count() == 0) {
+            throw ArtifactError("tensor column slice requires a positive rank-two shape");
+        }
+        validate_column_ranges(slice, shape[1]);
+        if (layout == StorageLayout::ContiguousLeV1) {
+            const auto elements = checked_mul(shape[0], slice.column_count(),
+                                              "sliced tensor element count");
+            return checked_mul(elements, direct_word_bytes(format), "sliced tensor encoded size");
+        }
+        if (layout == StorageLayout::RowSplitK128V1) {
+            // The physical group run must land on whole groups of every range and on the
+            // row-split K padding boundary, so the destination stays a dense row-split tensor.
+            for (const TensorSliceRange& range : slice.column_ranges) {
+                if (range.count == 0) { break; }
+                if (range.begin % kKAlignment != 0 || range.count % kKAlignment != 0) {
+                    throw ArtifactError(
+                        "row-split tensor column slice is not aligned to the K padding boundary");
+                }
+            }
+            const std::array<std::uint64_t, 2> sliced = {shape[0], slice.column_count()};
+            return row_split_geometry(format, sliced).encoded_bytes;
+        }
+        break;
+    }
+    throw ArtifactError("tensor layout does not support this slice kind");
+}
+
+std::vector<TensorSlicePlane> tensor_slice_planes(const TensorSlice& slice, StorageLayout layout,
+                                                  NumericFormat format,
+                                                  std::span<const std::uint64_t> shape) {
+    // Validates the slice and returns the per-plane source/destination layout the materializer
+    // walks. Every plane of a Rows slice is a set of whole-row runs (segment covers the row); a
+    // Columns plane is a per-row segment gather densified into the destination row stride.
+    (void)sliced_tensor_encoded_size(slice, layout, format, shape);
+    std::vector<TensorSlicePlane> planes;
+
+    if (layout == StorageLayout::ContiguousLeV1) {
+        const std::uint64_t row_bytes =
+            checked_mul(contiguous_row_bytes(shape), direct_word_bytes(format), "tensor row bytes");
+        if (slice.kind == TensorSliceKind::Columns) {
+            // One plane per column range: each source row contributes its segment, densified at
+            // the range's prefix offset inside the destination row stride.
+            const std::uint64_t word = direct_word_bytes(format);
+            std::uint64_t destination_offset = 0;
+            for (const TensorSliceRange& range : slice.column_ranges) {
+                if (range.count == 0) { break; }
+                TensorSlicePlane plane{};
+                plane.rows                   = shape[0];
+                plane.source_row_stride      = row_bytes;
+                plane.destination_row_stride = slice.column_count() * word;
+                plane.destination_offset     = destination_offset;
+                plane.segment_offset         = range.begin * word;
+                plane.segment_bytes          = range.count * word;
+                planes.push_back(plane);
+                destination_offset += range.count * word;
+            }
+            return planes;
+        }
+        TensorSlicePlane plane{};
+        plane.rows                   = shape[0];
+        plane.source_row_stride      = row_bytes;
+        plane.destination_row_stride = row_bytes;
+        plane.segment_bytes          = row_bytes;
+        planes.push_back(plane);
+        return planes;
+    }
+
+    if (layout != StorageLayout::RowSplitK128V1) {
+        throw ArtifactError("tensor layout does not support this slice kind");
+    }
+    const auto format_geometry = quant_geometry(format);
+    const RowSplitGeometry source = row_split_geometry(format, shape);
+    const std::array<std::uint64_t, 2> destination_shape = {
+        slice.kind == TensorSliceKind::Columns ? shape[0] : slice.row_count(),
+        slice.kind == TensorSliceKind::Columns ? slice.column_count() : shape[1]};
+    const RowSplitGeometry destination = row_split_geometry(format, destination_shape);
+
+    struct RowSplitPlane {
+        std::uint64_t source_offset;
+        std::uint64_t destination_offset;
+        std::uint64_t bytes_per_group;
+    };
+    const RowSplitPlane layout_planes[] = {
+        {0, 0, format_geometry.base_bytes_per_group},
+        {source.high_plane_offset, destination.high_plane_offset,
+         format_geometry.high_bytes_per_group},
+        {source.scale_plane_offset, destination.scale_plane_offset, 2},
+    };
+    if (slice.kind == TensorSliceKind::Columns) {
+        // One plane per (range, physical plane): the range's groups land at its group prefix
+        // inside the densified destination row.
+        std::uint64_t destination_group = 0;
+        for (const TensorSliceRange& range : slice.column_ranges) {
+            if (range.count == 0) { break; }
+            const std::uint64_t range_groups = range.count / source.group_size;
+            for (const RowSplitPlane& plane : layout_planes) {
+                if (plane.bytes_per_group == 0) { continue; }
+                TensorSlicePlane out{};
+                out.rows                   = shape[0];
+                out.source_offset          = plane.source_offset;
+                out.destination_offset     = plane.destination_offset +
+                                         destination_group * plane.bytes_per_group;
+                out.source_row_stride      = source.groups_per_row * plane.bytes_per_group;
+                out.destination_row_stride = destination.groups_per_row * plane.bytes_per_group;
+                out.segment_offset = (range.begin / source.group_size) * plane.bytes_per_group;
+                out.segment_bytes  = range_groups * plane.bytes_per_group;
+                planes.push_back(out);
+            }
+            destination_group += range_groups;
+        }
+        return planes;
+    }
+    for (const RowSplitPlane& plane : layout_planes) {
+        if (plane.bytes_per_group == 0) { continue; }
+        TensorSlicePlane out{};
+        out.rows                   = shape[0];
+        out.source_offset          = plane.source_offset;
+        out.destination_offset     = plane.destination_offset;
+        out.source_row_stride      = source.groups_per_row * plane.bytes_per_group;
+        out.destination_row_stride = source.groups_per_row * plane.bytes_per_group;
+        out.segment_bytes          = out.source_row_stride;
+        planes.push_back(out);
+    }
+    return planes;
+}
+
 BlockScaleGeometry block_scale_geometry(NumericFormat format,
                                         std::span<const std::uint64_t> shape) {
     if (format != NumericFormat::NVFP4) {

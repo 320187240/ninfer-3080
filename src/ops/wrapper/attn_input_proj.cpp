@@ -190,16 +190,22 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      cudaStream_t stream) {
     constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
     const std::int32_t cols        = x.ne[1];
+    const std::int32_t q_rows      = q.ne[0];
+    const std::int32_t kv_rows     = k.ne[0];
+    // Full geometry (6144/1024) or the two-rank tensor-parallel N-split (3072/512).
+    const bool full_geometry      = q_rows == 6144 && kv_rows == 1024;
+    const bool rank_shard_geometry = q_rows == 3072 && kv_rows == 512;
+    if (!full_geometry && !rank_shard_geometry) {
+        throw std::invalid_argument("attn_input_proj: unsupported query/KV row geometry");
+    }
     require_matrix(x, kHidden, cols, "x");
-    require_matrix(q, kQRows, cols, "q");
-    require_matrix(gate, kQRows, cols, "gate");
-    require_matrix(k, kKvRows, cols, "k");
-    require_matrix(v, kKvRows, cols, "v");
-    require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, "query/key weight");
-    require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
+    require_matrix(q, q_rows, cols, "q");
+    require_matrix(gate, q_rows, cols, "gate");
+    require_matrix(k, kv_rows, cols, "k");
+    require_matrix(v, kv_rows, cols, "v");
+    require_rowsplit(query_key_weight, QType::Q4G64_F16S, q_rows + kv_rows, "query/key weight");
+    require_rowsplit(gate_value_weight, QType::Q5G64_F16S, q_rows + kv_rows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);

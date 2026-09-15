@@ -27,6 +27,8 @@ struct Options {
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
+    bool tp = false; // two-rank tensor-parallel mode across devices {0,1}
+    TpClockHolderMode clock_holder_mode = TpClockHolderMode::Demand;
 
     bool raw_output      = false;
     bool print_token_ids = false;

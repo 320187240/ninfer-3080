@@ -72,7 +72,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|rk8v4] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] [--tp] [--no-tp-prefix-reuse] "
+           "[--clock-holder-mode demand|always|off] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -91,6 +92,14 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --no-tp-prefix-reuse opts out of compatible-prefix caching in two-GPU TP "
+           "mode (on by default with --tp)\n"
+           "       --clock-holder-mode selects the TP clock-holder behaviour: demand (default) "
+           "pulses only while requests are in flight; always keeps pulsing; off disables "
+           "entirely (not recommended: agentic decode measurably drops without pulses)\n"
+           "       --clock-holder-hold-ms demand-mode grace after the last engine op "
+           "(default 10000; covers 93% of a real agent session's request gaps; clocks park "
+           "after it expires)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -200,8 +209,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--tp") {
+            options.tp = true;
+        } else if (arg == "--clock-holder-mode") {
+            const std::string mode = require_value("--clock-holder-mode");
+            if (mode == "demand") {
+                options.tp_clock_holder = ninfer::TpClockHolderMode::Demand;
+            } else if (mode == "always") {
+                options.tp_clock_holder = ninfer::TpClockHolderMode::Always;
+            } else if (mode == "off") {
+                options.tp_clock_holder = ninfer::TpClockHolderMode::Off;
+            } else {
+                throw std::invalid_argument(
+                    "--clock-holder-mode must be demand, always, or off (got '" + mode + "')");
+            }
+        } else if (arg == "--clock-holder-hold-ms") {
+            options.tp_clock_holder_hold_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--clock-holder-hold-ms"), "clock-holder-hold-ms"));
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--no-tp-prefix-reuse") {
+            options.tp_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {

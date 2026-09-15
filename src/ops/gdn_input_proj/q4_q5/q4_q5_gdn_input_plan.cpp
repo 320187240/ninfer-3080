@@ -38,8 +38,12 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
-           problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
+    // Full GDN geometry and its two-rank tensor-parallel N-split (halved q/k and value/z blocks).
+    const bool full = problem.qk_rows == 4096 && problem.value_z_rows == 12288 &&
+                      problem.qkv_rows == 10240 && problem.z_rows == 6144;
+    const bool rank_shard = problem.qk_rows == 2048 && problem.value_z_rows == 6144 &&
+                            problem.qkv_rows == 5120 && problem.z_rows == 3072;
+    return problem.input_rows == 5120 && (full || rank_shard) && problem.padded_k == 5120;
 }
 
 } // namespace

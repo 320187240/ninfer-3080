@@ -9,10 +9,13 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6_27b/impl/load/tp_shard.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -27,6 +30,10 @@ struct WeightPlan {
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
+    // Effective materialized geometry after the two-rank shard slice (equal to the full shape
+    // on the single-GPU path and for Whole slices). The load path binds weights with these.
+    std::int32_t shape_rows    = 0;
+    std::int32_t shape_columns = 0;
 };
 
 struct MlpPlan {
@@ -60,6 +67,8 @@ struct FusedGdnInputProjectionPlan {
 };
 
 struct GdnPlan {
+    // Effective conv width after the shard slice (full width on the single-GPU path).
+    std::int32_t convolution_columns = 10240;
     artifact::ObjectHandle a_log;
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
@@ -80,14 +89,16 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    // Sharded MTP weights carry their effective post-slice geometry (full shape on the
+    // single-GPU path), exactly like the Text weight plans.
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;
@@ -101,8 +112,11 @@ struct BindingPlan {
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
-    artifact::ObjectHandle draft_head;
+    WeightPlan draft_head;
     artifact::ObjectHandle draft_head_token_ids;
+    // Effective shortlist rows after the shard slice (the token-ids object binds whole and
+    // carries no shape fields, so the count travels beside it).
+    std::int32_t draft_head_token_count = 131072;
     MtpPlan mtp;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
@@ -118,7 +132,30 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               qwen3_6::StartupFeatures features, std::uint8_t tp_rank,
+                               bool tp_active);
+
+// M3a shard context: caches this rank's slice for every Text/MTP weight the binder touches.
+// Inactive in the single-GPU path, where every bind places the whole tensor; when active, both
+// ranks place their shard (rank 0's shard is not the whole tensor).
+class TpShardContext {
+public:
+    TpShardContext(std::uint8_t rank, bool active) : rank_(rank), active_(active) {}
+
+    [[nodiscard]] bool active() const noexcept { return active_; }
+    [[nodiscard]] std::uint8_t rank() const noexcept { return rank_; }
+
+    [[nodiscard]] const artifact::TensorSlice* shard(std::string_view name) {
+        const auto [entry, inserted] = slices_.emplace(std::string(name), artifact::TensorSlice{});
+        if (inserted) { entry->second = tp_weight_shard(name, rank_); }
+        return &entry->second;
+    }
+
+private:
+    std::uint8_t rank_;
+    bool active_;
+    std::map<std::string, artifact::TensorSlice> slices_;
+};
 
 struct DensePostMixerPayload {
     Weight gate_up;

@@ -1,6 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
+#include "targets/qwen3_6/impl/runtime/tp_trace.h"
 
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
@@ -340,7 +341,11 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         emb = input_embeddings->view({kCfg.hidden, T});
     } else {
         emb = roots.embedding;
-        ops::embedding(flat_ids, *embed_, emb, s);
+        if (tp_ == nullptr) {
+            ops::embedding(flat_ids, *embed_, emb, s);
+        } else {
+            tp_embedding_gather(*tp_, flat_ids, *embed_, emb, T, s);
+        }
     }
 
     Tensor e = roots.normalized_embedding;
@@ -349,10 +354,20 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(flat_hidden, *mtp_.pre_fc_norm_hidden, kCfg.rms_eps, true, h, s);
 
     Tensor fc_in = roots.packed_input;
-    ops::mtp_pack_fc_input(e, h, fc_in, s);
+    if (tp_ == nullptr) { ops::mtp_pack_fc_input(e, h, fc_in, s); }
 
     x = roots.residual;
-    ops::linear(fc_in, *mtp_.fc, x, s);
+    if (tp_ == nullptr) {
+        ops::linear(fc_in, *mtp_.fc, x, s);
+    } else {
+        // The fc weight is column-split and the packed input is [e;h]: side 0's half
+        // multiplies e and side 1's multiplies h (both contiguous roots), so each rank
+        // GEMMs its own half and the allreduce sums the two partial projections into the
+        // full x on both ranks. The pack is skipped on the TP path.
+        const Tensor& fc_half = tp_->side == 0 ? e : h;
+        ops::linear(fc_half, *mtp_.fc, x, s);
+        tp_allreduce_hidden(*tp_, x, T, s);
+    }
 
     ah = roots.attention_hidden;
     ops::rmsnorm(x, *mtp_.input_norm, kCfg.rms_eps, true, ah, s);
@@ -407,15 +422,26 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
     Tensor o        = post.output;
+    Tensor mh       = post.post_mixer_hidden;
+    // Row-parallel attention output with the fused residual add: the partial lands in the
+    // residual stream on side 0 and a zeroed scratch on side 1, and the commit's allreduce
+    // yields the full sum on both ranks.
+    Tensor residual_target = x;
+    if (tp_ != nullptr) { residual_target = tp_row_parallel_target(*tp_, x, T, s); }
     ops::linear(a.view({kCfg.q_size, T}), *mtp_.o_proj, o, s);
-    ops::residual_add(o, x, s);
-
-    Tensor mh = post.post_mixer_hidden;
+    ops::residual_add(o, residual_target, s);
+    if (tp_ != nullptr) { tp_row_parallel_commit(*tp_, x, residual_target, T, s); }
     ops::rmsnorm(x, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
-        Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+        if (tp_ == nullptr) {
+            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+        } else {
+            Tensor target = tp_row_parallel_target(*tp_, x, T, s);
+            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, target, work_, s);
+            tp_row_parallel_commit(*tp_, x, target, T, s);
+        }
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({kCfg.hidden, T});
@@ -535,13 +561,23 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
-        ops::residual_add(o, x_last, s);
+        // Row-parallel attention output with the fused residual add (see mtp_forward_tail).
+        Tensor residual_target = x_last;
+        if (tp_ != nullptr) { residual_target = tp_row_parallel_target(*tp_, x_last, 1, s); }
+        ops::residual_add(o, residual_target, s);
+        if (tp_ != nullptr) { tp_row_parallel_commit(*tp_, x_last, residual_target, 1, s); }
 
         Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
+            if (tp_ == nullptr) {
+                Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
+            } else {
+                Tensor target = tp_row_parallel_target(*tp_, x_last, 1, s);
+                Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, target, work_, s);
+                tp_row_parallel_commit(*tp_, x_last, target, 1, s);
+            }
         }
         ops::rmsnorm(x_last, *mtp_.norm, kCfg.rms_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
@@ -556,13 +592,25 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
         ops::linear(hidden, *proposal_head_, proposal_logits, ctx_.stream);
-        ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
-        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
-                                      ctx_.stream);
+        if (tp_ == nullptr) {
+            ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                          ctx_.stream);
+        } else {
+            // Each rank reduces its shortlist half and maps the local winner through its
+            // remap half before the exchange, so the two candidates compare (value, global
+            // token id) and both ranks commit the same draft token.
+            tp_argmax_sample_rows(*tp_, proposal_logits, T, proposal_tokens, ctx_.stream,
+                                  proposal_head_ids_);
+        }
     } else {
         Tensor output_logits = matrix_window(logits, T);
         ops::linear(hidden, *lm_head_, output_logits, ctx_.stream);
-        ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
+        if (tp_ == nullptr) {
+            ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
+        } else {
+            tp_argmax_sample_rows(*tp_, output_logits, T, proposal_tokens, ctx_.stream);
+        }
     }
 }
 
@@ -662,7 +710,11 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
         Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
-        ops::embedding(ids, *embed_, x, stream);
+        if (tp_ == nullptr) {
+            ops::embedding(ids, *embed_, x, stream);
+        } else {
+            tp_embedding_gather(*tp_, ids, *embed_, x, batch, stream);
+        }
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
@@ -714,7 +766,11 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
         Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
+        if (tp_ == nullptr) {
+            ops::embedding(flat_ids, *embed_, x, stream);
+        } else {
+            tp_embedding_gather(*tp_, flat_ids, *embed_, x, columns, stream);
+        }
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -725,7 +781,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (tp_ == nullptr) {
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        } else {
+            // One multi-candidate exchange reduces every column's winner across the vocab
+            // slices; both ranks then hold identical target tokens for the accept logic.
+            tp_argmax_sample_rows(*tp_, flat_logits, columns, flat_tokens, stream);
+        }
     }
     work_.reset();
 }
@@ -847,19 +909,59 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     }
     ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    if (tp_ == nullptr) {
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    } else {
+        Tensor target = tp_row_parallel_target(*tp_, x, T, s);
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, target, ph,
+                                             work_, s);
+        tp_row_parallel_commit(*tp_, x, target, T, s);
+    }
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    const bool trace = tp_trace_dir() != nullptr && ph == Phase::Prefill && gidx == 0;
+    const char* rank = tp_trace_rank(tp_);
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
-                                         work_, s);
+    if (tp_ != nullptr) {
+        // The a/b control projections are duplicated full-width and their kernels are fixed
+        // to the registered head count, so the TP rank computes all heads and extracts its
+        // V-head half into a contiguous buffer (heads are the fastest tensor dimension, so a
+        // plain view of the full-width output would be strided).
+        const std::int32_t full_heads = 2 * kCfg.gdn_v_heads;
+        Tensor g_full                 = work_.alloc(DType::FP32, {full_heads, T});
+        Tensor beta_full              = work_.alloc(DType::FP32, {full_heads, T});
+        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h,
+                                             g_full, beta_full, work_, s);
+        if (trace) { tp_trace_dump(rank, "Gh", h, s); tp_trace_dump(rank, "Ggfull", g_full, s); }
+        const std::int32_t begin = tp_->side * kCfg.gdn_v_heads;
+        Tensor g_rank            = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
+        Tensor beta_rank         = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
+        const std::size_t width  = static_cast<std::size_t>(kCfg.gdn_v_heads) * sizeof(float);
+        const std::size_t source_pitch =
+            static_cast<std::size_t>(full_heads) * sizeof(float);
+        const std::size_t target_pitch =
+            static_cast<std::size_t>(kCfg.gdn_v_heads) * sizeof(float);
+        const auto* g_source = static_cast<const std::byte*>(g_full.data) + begin * sizeof(float);
+        const auto* b_source = static_cast<const std::byte*>(beta_full.data) + begin * sizeof(float);
+        CUDA_CHECK(cudaMemcpy2DAsync(g_rank.data, target_pitch, g_source, source_pitch, width,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpy2DAsync(beta_rank.data, target_pitch, b_source, source_pitch, width,
+                                     static_cast<std::size_t>(T), cudaMemcpyDeviceToDevice, s));
+        g    = g_rank;
+        beta = beta_rank;
+        if (trace) { tp_trace_dump(rank, "Gg", g, s); tp_trace_dump(rank, "Gbeta", beta, s); }
+    } else {
+        Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g,
+                                             beta, work_, s);
+        if (trace) { tp_trace_dump(rank, "Gh", h, s); tp_trace_dump(rank, "Gg", g, s); }
+    }
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -908,6 +1010,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+        if (trace) {
+            tp_trace_dump(rank, "Gz", z.view({kCfg.gdn_v_dim * kCfg.gdn_v_heads, T}), s);
+            tp_trace_dump(rank, "Gqkvc", qkv_c, s);
+        }
     }
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
@@ -946,13 +1052,22 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state, o, s);
+        if (trace) { tp_trace_dump(rank, "Go", o.view({kCfg.gdn_v_dim * kCfg.gdn_v_heads, T}), s); }
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (trace) { tp_trace_dump(rank, "Gon", on.view({kCfg.gdn_v_dim * kCfg.gdn_v_heads, T}), s); }
 
-    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    if (tp_ == nullptr) {
+        Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    } else {
+        Tensor target = tp_row_parallel_target(*tp_, x, T, s);
+        Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, target, ph,
+                                       work_, s);
+        tp_row_parallel_commit(*tp_, x, target, T, s);
+    }
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -961,7 +1076,13 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    if (tp_ == nullptr) {
+        Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    } else {
+        Tensor target = tp_row_parallel_target(*tp_, x, T, s);
+        Variant::post_mixer(h, *m.payload, target, ph, work_, s);
+        tp_row_parallel_commit(*tp_, x, target, T, s);
+    }
 }
 
 template <class Tap>
@@ -988,6 +1109,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if (prefill && tp_trace_dir() != nullptr) {
+                    char stage[16];
+                    std::snprintf(stage, sizeof(stage), "L%02d", layer);
+                    tp_trace_dump(tp_trace_rank(tp_), stage, x, ctx_.stream);
+                }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1009,6 +1135,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
+                if (prefill && tp_trace_dir() != nullptr) {
+                    char stage[16];
+                    std::snprintf(stage, sizeof(stage), "L%02d", layer);
+                    tp_trace_dump(tp_trace_rank(tp_), stage, x, ctx_.stream);
+                }
             }
         }
     }
@@ -1147,7 +1278,11 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
+            if (tp_ == nullptr) {
+                ops::embedding(ids_device, *embed_, x, s);
+            } else {
+                tp_embedding_gather(*tp_, ids_device, *embed_, x, len, s);
+            }
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1156,6 +1291,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
+            if (tp_trace_dir() != nullptr) {
+                tp_trace_dump(tp_trace_rank(tp_), "emb", x, s);
+                tp_trace_scalar(tp_trace_rank(tp_), "prompt_tokens", T);
+            }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
@@ -1165,6 +1304,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+            if (tp_trace_dir() != nullptr) { tp_trace_dump(tp_trace_rank(tp_), "final", xf, s); }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
@@ -1175,11 +1315,22 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // decode step, which reuses the same io_.pos).
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
                 ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
-                if (sampling_config_ != nullptr) {
+                if (tp_ != nullptr) {
+                    tp_argmax_sample(*tp_, logits, io_.token, s);
+                } else if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
                                 ops::kSamplePurposePrefill, work_, s);
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
+                }
+                if (tp_trace_dir() != nullptr) {
+                    tp_trace_dump(tp_trace_rank(tp_), "logits", logits, s);
+                    std::int32_t winner = -1;
+                    if (cudaStreamSynchronize(s) == cudaSuccess) {
+                        (void)cudaMemcpy(&winner, io_.token.data, sizeof(winner),
+                                         cudaMemcpyDeviceToHost);
+                    }
+                    tp_trace_scalar(tp_trace_rank(tp_), "argmax_token", winner);
                 }
             }
 
@@ -1221,7 +1372,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
                 if (multimodal != nullptr) {
                     mtp_input_embeddings = work_.alloc(DType::BF16, {kCfg.hidden, len});
-                    ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
+                    if (tp_ == nullptr) {
+                        ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
+                    } else {
+                        // The multimodal stem input composes against the vocab-parallel
+                        // gather exactly like the ordinary MTP stem (mtp_forward_stem).
+                        tp_embedding_gather(*tp_, mtp_ids, *embed_, mtp_input_embeddings, len, s);
+                    }
                     if (vision_chunk.control != nullptr) {
                         const qwen3_6::MtpVisualOverlap overlap = qwen3_6::shifted_visual_overlap(
                             vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);
@@ -1289,7 +1446,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
     prefill_turn_checkpoint_frontier_ = -1;
 
-    ctx_.synchronize();
+    // The TP coordinator syncs both ranks after the mirrored schedules are enqueued; syncing
+    // here would deadlock this rank's allreduce spins against the peer's still-pending pass.
+    if (tp_ == nullptr) { ctx_.synchronize(); }
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T};

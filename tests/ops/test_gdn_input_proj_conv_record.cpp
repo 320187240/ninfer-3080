@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -324,10 +325,12 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
+#ifndef NINFER_SM8X_COMPAT
     failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
     failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+#endif
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }
@@ -341,9 +344,14 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_q4_q5();
-    failures += run_w8();
-    failures += run_nvfp4();
+    try {
+        failures += run_q4_q5();
+        failures += run_w8();
+        failures += run_nvfp4();
+    } catch (const std::exception& error) {
+        std::cerr << "unexpected exception: " << error.what() << '\n';
+        return 1;
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

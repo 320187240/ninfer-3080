@@ -5,7 +5,8 @@
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device.h"
+#include "ops/launcher/smem_attr.h" // CUDA_CHECK
 
 #include <cstdint>
 
@@ -20,10 +21,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    CUDA_CHECK(attr_bf16);
+    set_max_dynamic_smem_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+                                    kGqaPrefillSmemBytes);
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
@@ -31,10 +30,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
         const auto launch_i8 = [&]<bool PackedV, bool RotateK, bool RotateV>() {
-            static const cudaError_t attr_i8 = cudaFuncSetAttribute(
+            set_max_dynamic_smem_per_device(
                 gqa_attention_prefill_i8_kernel<Geometry, PackedV, RotateK, RotateV, Metadata>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
-            CUDA_CHECK(attr_i8);
+                kGqaPrefillI8SmemBytes);
             gqa_attention_prefill_i8_kernel<Geometry, PackedV, RotateK, RotateV, Metadata>
                 <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -149,6 +147,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                                                  metadata, out, stream);
         return;
     }
+    if (q.ne[1] == GqaTpGeometry::QHeads) {
+        gqa_attention_prompt_attention_launch_for<GqaTpGeometry>(q, positions, scale, cache,
+                                                                 metadata, out, stream);
+        return;
+    }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
                                                              out, stream);
 }
@@ -161,7 +164,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
         return;
     }
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    // GqaTpGeometry and Gqa35Geometry share KVHeads=2; the append math depends only on it.
+    gqa_kv_append_launch_for<GqaTpGeometry>(k, v, positions, cache, metadata, stream);
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -179,6 +183,12 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] == GqaTpGeometry::QHeads) {
+            gqa_kv_append_launch_for<GqaTpGeometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<GqaTpGeometry>(q, positions, scale, cache,
                                                                      metadata, out, stream);
             return;
         }

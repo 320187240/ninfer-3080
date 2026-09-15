@@ -39,6 +39,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    TpExec* tp = nullptr; // two-rank tensor parallelism; null on the single-GPU path
 };
 
 struct PrefillContext {

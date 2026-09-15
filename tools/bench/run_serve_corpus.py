@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import os
+import signal
 import statistics
 import subprocess
 import sys
@@ -200,7 +201,11 @@ class RunningServer:
 
     def __enter__(self) -> "RunningServer":
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
-        self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
+        # Windows: the server flushes its final throughput interval only on a graceful
+        # SIGINT/SIGTERM stop, and Popen.terminate() there is a hard kill. A new process
+        # group lets stop() deliver CTRL_C_EVENT to the server alone.
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        self.process = subprocess.Popen(self.command, cwd=REPO_ROOT, creationflags=creationflags)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
         return self
 
@@ -210,7 +215,10 @@ class RunningServer:
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
             return
-        self.process.terminate()
+        if os.name == "nt":
+            self.process.send_signal(signal.CTRL_C_EVENT)
+        else:
+            self.process.terminate()
         try:
             self.process.wait(timeout=15.0)
         except subprocess.TimeoutExpired:

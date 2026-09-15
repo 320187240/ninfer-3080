@@ -56,13 +56,15 @@ class Point:
     speculative_backend: str
     draft_tokens: int
     sampling_mode: str
+    tp: bool
     suite: str
     concurrency: int
 
     @property
     def key(self) -> str:
+        tp = "tp_" if self.tp else ""
         return (
-            f"{self.target}_{self.speculative_mode}_{self.sampling_mode}_"
+            f"{tp}{self.target}_{self.speculative_mode}_{self.sampling_mode}_"
             f"{self.suite.replace('-', '_')}_c{self.concurrency}"
         )
 
@@ -150,12 +152,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument(
+        "--tp",
+        action="store_true",
+        help="two-rank tensor-parallel serving across CUDA devices 0 and 1 "
+        "(greedy-only; requires --sampling greedy)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="print point commands and request counts only"
     )
     return parser.parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.tp and args.sampling != "greedy":
+        raise corpus.CampaignError("--tp is greedy-only; pass --sampling greedy")
     if args.port < 1 or args.port > 65535:
         raise corpus.CampaignError("--port must be in [1, 65535]")
     if args.device < 0:
@@ -204,6 +214,7 @@ def build_points(
                             speculative_backend=backend,
                             draft_tokens=draft_tokens,
                             sampling_mode=args.sampling,
+                            tp=args.tp,
                             suite=suite,
                             concurrency=concurrency,
                         )
@@ -309,6 +320,8 @@ def server_command(
         "int8",
         "--no-prefix-reuse",
     ]
+    if point.tp:
+        command.append("--tp")
     if point.speculative_backend != "none":
         command.extend(
             [
@@ -366,6 +379,10 @@ def validate_server_start(
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
+    if args.tp and engine.get("tp_devices") != [0, 1]:
+        raise corpus.CampaignError(
+            f"server_start engine is not two-rank tensor-parallel: {engine.get('tp_devices')!r}"
+        )
     if event.get("sampling_defaults", {}).get("greedy") != (
         point.sampling_mode == "greedy"
     ):
@@ -730,6 +747,7 @@ def analyze_point(
         "speculative_backend": point.speculative_backend,
         "draft_tokens": point.draft_tokens,
         "sampling_mode": point.sampling_mode,
+        "tp": point.tp,
         "suite": point.suite,
         "workload_order": workload_order(point),
         "concurrency": point.concurrency,
@@ -803,7 +821,7 @@ def run_point(
 
 
 def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
-    baselines: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    baselines: dict[tuple[str, str, str, str, str, bool], dict[str, Any]] = {}
     for report in reports:
         key = (
             str(report["target"]),
@@ -811,6 +829,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
             str(report["speculative_mode"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
+            bool(report["tp"]),
         )
         if int(report["concurrency"]) == 1:
             baselines[key] = report
@@ -822,6 +841,7 @@ def add_speedups(reports: Sequence[dict[str, Any]]) -> None:
             str(report["speculative_mode"]),
             str(report["sampling_mode"]),
             str(report["suite"]),
+            bool(report["tp"]),
         )
         baseline = baselines.get(key)
         if baseline is None:
@@ -842,6 +862,7 @@ SUMMARY_FIELDS = (
     "weights_id",
     "speculative_mode",
     "sampling_mode",
+    "tp",
     "corpus_order_seed",
     "concurrency",
     "request_count",
@@ -866,6 +887,7 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
         "weights_id": report["weights_id"],
         "speculative_mode": report["speculative_mode"],
         "sampling_mode": report["sampling_mode"],
+        "tp": report["tp"],
         "corpus_order_seed": report.get("workload_order", {}).get("seed"),
         "concurrency": report["concurrency"],
         "request_count": report["request_count"],
@@ -939,20 +961,23 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
             {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
         )
 
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str, bool], list[dict[str, Any]]] = {}
     for row in rows:
         key = (
             str(row["target"]),
             str(row["weights_id"]),
             str(row["speculative_mode"]),
             str(row["suite"]),
+            bool(row["tp"]),
         )
         groups.setdefault(key, []).append(row)
 
     sections: list[str] = []
-    for (target, weights_id, mode, suite), group in groups.items():
+    for (target, weights_id, mode, suite, tp), group in groups.items():
         group.sort(key=lambda row: int(row["concurrency"]))
         title = f"## {target} / {weights_id} / {mode} / {suite}"
+        if tp:
+            title += " / tp"
         if suite == "decode-saturation":
             table = markdown_table(
                 ("C", "Requests", "Steady s", "Avg batch", "Decode tok/s", "Speedup"),

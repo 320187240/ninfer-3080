@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/device.h" // CUDA_CHECK
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -55,7 +56,14 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        // CUDA's current device is per-thread state. Every prefill/decode/graph round launches
+        // from this worker; a fresh thread defaults to device 0 and would hand the driver
+        // pointers allocated on another context. Bind it to the Engine's device before the
+        // first launch. The id is already validated by DeviceContext on the constructing thread.
+        worker_ = std::thread([this, device = options.device] {
+            CUDA_CHECK(cudaSetDevice(device));
+            worker_loop();
+        });
     }
 
     ~ConcurrentExecutor() noexcept {
@@ -716,7 +724,26 @@ private:
                 selected_reuse = reuse;
             }
         }
-        if (selected) { return selected; }
+        if (selected) {
+            // Prefer a lane with no retained resident prefix: a retained lane this request
+            // cannot reuse is about to be overwritten anyway, but every OTHER retained lane
+            // it displaces through capacity arithmetic may still match the next arrival from
+            // its own session. Admission onto a clean lane (reuse == 0 here means the plan
+            // reuses nothing from that lane) keeps those candidates resident. This never
+            // overrides the reuse-maximizing choice: a lane the request reuses from stays
+            // preferred over every clean lane.
+            if (selected_reuse == 0) {
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (slots_[lane] == nullptr && !instance_.program->has_retained_lane(lane)) {
+                        ensure_lane_plan(request, lane);
+                        if (instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                            return LaneChoice{.lane = lane};
+                        }
+                    }
+                }
+            }
+            return selected;
+        }
 
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
@@ -767,15 +794,32 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
-            for (std::uint32_t retained_lane = 0;
-                 retained_lane < max_concurrency_ &&
-                 !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
+            // Evict as a last resort, and evict by least prospective value: a retained lane
+            // whose prefix this request reuses (reuse > 0 on that lane's plan) is the very
+            // state admission is trying to exploit, so it must be the LAST candidate dropped.
+            // Retained lanes the request does not reuse from go first — they only free
+            // capacity — and among those the shortest prefix (fewest resident tokens, least
+            // work to rebuild) goes before longer ones. This keeps the maximum-reuse lane
+            // untouched whenever any other eviction can satisfy admission.
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> evict_order;
+            for (std::uint32_t retained_lane = 0; retained_lane < max_concurrency_;
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
-                    invalidate_lane_plans(retained_lane);
+                    const std::uint32_t retained_reuse =
+                        request->lane_plans[retained_lane]
+                            ? request->lane_plans[retained_lane]->summary().reusable_prompt_tokens
+                            : 0;
+                    evict_order.emplace_back(retained_reuse, retained_lane);
                 }
+            }
+            std::sort(evict_order.begin(), evict_order.end());
+            for (const auto& [retained_reuse, retained_lane] : evict_order) {
+                if (instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
+                    break;
+                }
+                instance_.program->evict_retained_lane(retained_lane);
+                invalidate_lane_plans(retained_lane);
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
                 throw std::logic_error("retained eviction did not make admission feasible");

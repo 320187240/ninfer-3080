@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <span>
 #include <string>
@@ -783,6 +784,7 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+#ifndef NINFER_SM8X_COMPAT
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
@@ -817,6 +819,7 @@ int run_nvfp4() {
                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
+#endif
     return failures;
 }
 
@@ -829,39 +832,46 @@ int main() {
     }
 
     int failures = 0;
-    const std::size_t q4_interval =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
-    const std::size_t q4_witness =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 4, 4);
-    const std::size_t q4_right_endpoint =
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
-    if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
-        std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
-        ++failures;
+    try {
+        const std::size_t q4_interval =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 1, 6);
+        const std::size_t q4_witness =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 4, 4);
+        const std::size_t q4_right_endpoint =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, 1, 6, 6);
+        if (q4_interval != q4_witness || q4_witness == 0 || q4_right_endpoint != 0) {
+            std::cerr << "Q4/Q5 snapshot interval did not retain its non-monotonic T=4 route\n";
+            ++failures;
+        }
+        if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1,
+                                                                       16) != 0 ||
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                2048, 2048, 4096, 1, 1, 17) !=
+                ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
+                                                                           17)) {
+            std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
+            ++failures;
+        }
+        const std::size_t nvfp4_a4_4 =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
+        if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
+            nvfp4_a4_4 == 0 ||
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
+            std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
+            ++failures;
+        }
+        failures += run_q4_q5();
+        failures += run_w8();
+        failures += run_nvfp4();
+    } catch (const std::exception& error) {
+        std::cerr << "unexpected exception: " << error.what() << '\n';
+        return 1;
     }
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
-            0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
-                                                                       17)) {
-        std::cerr << "W8 snapshot interval did not preserve its zero/nonzero route boundary\n";
-        ++failures;
-    }
-    const std::size_t nvfp4_a4_4 = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 4, 4);
-    if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::A16Only, 1, 1, 16) != 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 3) != 0 ||
-        nvfp4_a4_4 == 0 ||
-        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-            QType::NVFP4, 16384, 5120, ops::LinearPolicy::AllowA4, 1, 1, 4) != nvfp4_a4_4) {
-        std::cerr << "NVFP4 snapshot interval did not preserve its A16/A4 route boundary\n";
-        ++failures;
-    }
-    failures += run_q4_q5();
-    failures += run_w8();
-    failures += run_nvfp4();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

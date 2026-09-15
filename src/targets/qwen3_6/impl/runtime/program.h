@@ -12,6 +12,8 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/tp_retention.h"
+#include "targets/qwen3_6/impl/runtime/tp_exec.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -219,12 +221,33 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Host-only fingerprint of one lane's retained-sequence state. The TP coordinator
+    // compares both ranks' digests after every mirrored lifecycle op so a divergence becomes
+    // an explicit error instead of silently corrupting reused KV.
+    [[nodiscard]] qwen3_6::detail::RetentionDigest
+    sequence_retention_digest(std::uint32_t lane) const;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
+
+    // Two-rank tensor-parallel seam. A TpProgram coordinator sets the per-rank TpExec (routed
+    // into every Text schedule) and replaces the post-round device synchronization: the
+    // coordinator's handler enqueues the mirrored peer schedule and syncs both ranks, which a
+    // per-rank sync cannot do (this rank's exchange kernels spin until the peer launches).
+    void set_tp_execution(schedule::TpExec* tp) noexcept { tp_exec_ = tp; }
+    void set_round_sync(void (*handler)(void* context), void* context) noexcept {
+        round_sync_handler_  = handler;
+        round_sync_context_  = context;
+    }
+    void synchronize_round();
+
+    // Graph preparation entry point. Runs inside the constructor unless the plan defers it
+    // (two-rank TP): the coordinator installs the seams above first, then calls this on both
+    // ranks concurrently — code warm-up and qualification launches execute real exchanges.
+    void prepare_program_graphs();
 
     const LoadedModelData& model;
     DeviceContext& device;
@@ -281,8 +304,16 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
 
+    schedule::TpExec* tp_exec_   = nullptr;
+    void (*round_sync_handler_)(void*) = nullptr;
+    void* round_sync_context_    = nullptr;
+
 private:
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
+    // Cancel-boundary retention shared by abort_lane and cancelled resolve rows: parks the
+    // lane's committed watermark as a retained prefix, or clears the lane when the watermark
+    // cannot be made reusable. noexcept by contract (a throw inside clears the lane).
+    bool retain_cancelled_lane_(std::uint32_t lane) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,

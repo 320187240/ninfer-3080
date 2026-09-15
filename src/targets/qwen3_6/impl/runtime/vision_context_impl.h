@@ -321,9 +321,9 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
                                            WorkspaceArena& workspace,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
+                                           runtime::TransientRegion transient, TpExec* tp)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+      tp_(tp), context_(device, model) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -397,15 +397,25 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             patch_elements > prompt_.patches.size() - patch_offset) {
             throw std::invalid_argument("Vision item patch range exceeds prepared payload");
         }
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        context_.encode(
-            VisionItemView{
-                std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
-                &control},
-            output, workspace_);
-        timers_.back().record_stop();
-        workspace_.reset();
+        if (tp_ == nullptr || tp_->side == 0) {
+            // Single GPU, or the TP lead rank: the tower runs here. The peer rank skips the
+            // encode entirely and joins only the broadcast exchange below, so the two GPUs'
+            // FP-reduction-order divergence never reaches the mirrored text prefill.
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            context_.encode(
+                VisionItemView{
+                    std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
+                    &control},
+                output, workspace_);
+            timers_.back().record_stop();
+            workspace_.reset();
+        }
+        if (tp_ != nullptr) {
+            // Pass-through exchange: rank 0 contributes its embeddings, rank 1 the zero
+            // scratch; the sum is exactly rank 0's bf16 values on both ranks (tp_exec.h).
+            tp_vision_broadcast(*tp_, output, device_.stream);
+        }
         active_item_        = active->item_index;
         final_item_encoded_ = active->item_index == final_item_;
     }

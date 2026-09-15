@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -65,6 +66,79 @@ struct RowSplitGeometry {
 };
 
 RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+// One rank's slice of a stored tensor, expressed against the full artifact shape. Rows keeps the
+// stored layout per plane and concatenates disjoint source row ranges; Columns keeps every row and
+// gathers disjoint column ranges in order, densified at materialization time. Both are exact byte
+// transforms.
+enum class TensorSliceKind : std::uint8_t {
+    Whole,
+    Rows,
+    Columns,
+};
+
+struct TensorSliceRange {
+    std::uint64_t begin = 0;
+    std::uint64_t count = 0;
+};
+
+struct TensorSlice {
+    TensorSliceKind kind                          = TensorSliceKind::Whole;
+    std::array<TensorSliceRange, 4> rows          = {};
+    std::array<TensorSliceRange, 4> column_ranges = {};
+
+    [[nodiscard]] constexpr std::size_t used_row_ranges() const noexcept {
+        std::size_t used = 0;
+        for (const TensorSliceRange& range : rows) {
+            if (range.count == 0) { break; }
+            ++used;
+        }
+        return used;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t row_count() const noexcept {
+        std::uint64_t total = 0;
+        for (const TensorSliceRange& range : rows) { total += range.count; }
+        return total;
+    }
+
+    [[nodiscard]] constexpr std::size_t used_column_ranges() const noexcept {
+        std::size_t used = 0;
+        for (const TensorSliceRange& range : column_ranges) {
+            if (range.count == 0) { break; }
+            ++used;
+        }
+        return used;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t column_count() const noexcept {
+        std::uint64_t total = 0;
+        for (const TensorSliceRange& range : column_ranges) { total += range.count; }
+        return total;
+    }
+};
+
+std::uint64_t sliced_tensor_encoded_size(const TensorSlice& slice, StorageLayout layout,
+                                         NumericFormat format,
+                                         std::span<const std::uint64_t> shape);
+
+// Per-plane source/destination layout of a slice: each plane covers `rows` source rows of
+// `segment_bytes` at `segment_offset` within every `source_row_stride` bytes, densified into
+// `destination_row_stride`. Rows-slice planes still carry full-row segments; the materializer
+// coalesces their row ranges into plain copies.
+struct TensorSlicePlane {
+    std::uint64_t source_offset           = 0;
+    std::uint64_t destination_offset      = 0;
+    std::uint64_t rows                    = 0;
+    std::uint64_t source_row_stride       = 0;
+    std::uint64_t destination_row_stride  = 0;
+    std::uint64_t segment_offset          = 0;
+    std::uint64_t segment_bytes           = 0;
+};
+
+std::vector<TensorSlicePlane> tensor_slice_planes(const TensorSlice& slice, StorageLayout layout,
+                                                  NumericFormat format,
+                                                  std::span<const std::uint64_t> shape);
 
 struct BlockScaleGeometry {
     std::uint64_t rows                  = 0;

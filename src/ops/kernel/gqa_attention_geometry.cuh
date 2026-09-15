@@ -21,5 +21,7 @@ struct GqaGeometry {
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;
 using Gqa35Geometry = GqaGeometry<16, 2, 2>;
+// Two-rank tensor-parallel rank shape of the 27B geometry: half of every head block.
+using GqaTpGeometry = GqaGeometry<12, 2, 1>;
 
 } // namespace ninfer::ops

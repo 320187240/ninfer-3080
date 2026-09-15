@@ -1,0 +1,3 @@
+# Fixture files are byte-compared or sha256-gated by tests; core.autocrlf must not
+# rewrite them between index and working tree.
+tests/fixtures/** text eol=lf

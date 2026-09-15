@@ -13,11 +13,13 @@ class MaterializedArtifact;
 
 [[nodiscard]] ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
                                        std::initializer_list<std::uint64_t> shape,
-                                       TensorPlacement placement);
+                                       TensorPlacement placement,
+                                       const TensorSlice* slice = nullptr);
 
 [[nodiscard]] ObjectHandle bind_device_tensor(Binder& binder, std::string_view name,
                                               NumericFormat format,
-                                              std::initializer_list<std::uint64_t> shape);
+                                              std::initializer_list<std::uint64_t> shape,
+                                              const TensorSlice* slice = nullptr);
 
 [[nodiscard]] ObjectHandle bind_raw_resource(Binder& binder, std::string_view name);
 

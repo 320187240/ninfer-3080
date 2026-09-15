@@ -9,6 +9,7 @@ cmake-build-*/
 compile_commands.json
 CMakeUserPresets.json
 .cache/
+.vcpkg/
 
 # CUDA / profiling artifacts
 *.nsys-rep
@@ -54,3 +55,4 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+*.exe

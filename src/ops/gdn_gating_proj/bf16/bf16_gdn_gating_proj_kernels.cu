@@ -5,7 +5,8 @@
 #include "ops/common/warp.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
 
-#include "core/device.h" // CUDA_CHECK
+#include "core/device.h"
+#include "ops/launcher/smem_attr.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 
@@ -255,6 +256,69 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
+// Two-pass split-K epilogue: folds the per-split FP32 partials written by the MMA partial
+// kernel into g/beta (and, for the fused-norm variant, normalized_x). Replaces the former
+// in-kernel cooperative grid reduction, whose grid-wide residency requirement made every
+// split route reject its own launch (cudaErrorCooperativeLaunchTooLarge) once competing
+// display load shrank the device-wide CTA budget on a WDDM host.
+template <class Geometry, int SplitK, bool NormalizeInput = false>
+__global__ void bf16_gdn_gating_proj_mma_reduce_kernel(
+    const float* __restrict__ partial, const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ normalized_x,
+    float norm_eps, const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    float* __restrict__ g, float* __restrict__ beta, std::int32_t t) {
+    constexpr int kHeads       = Geometry::kHeads;
+    constexpr int kHidden      = Geometry::kHidden;
+    constexpr int kLogicalRows = 2 * kHeads;
+    const int elems            = kHeads * t;
+    const int stride  = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int thread0 = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                        static_cast<int>(threadIdx.x);
+    if constexpr (NormalizeInput) {
+        const float* norm_partial = partial + static_cast<std::int64_t>(SplitK) * t * kLogicalRows;
+        const int hidden_elems    = kHidden * t;
+        for (int i = thread0; i < hidden_elems; i += stride) {
+            const int k     = i % kHidden;
+            const int token = i / kHidden;
+            float sum       = 0.0F;
+#pragma unroll
+            for (int s = 0; s < SplitK; ++s) {
+                sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
+            }
+            const float inv    = rsqrtf(sum / static_cast<float>(kHidden) + norm_eps);
+            const float value  = __bfloat162float(x[i]);
+            const float weight = __bfloat162float(norm_weight[k]);
+            normalized_x[i]    = __float2bfloat16_rn(value * inv * (1.0F + weight));
+        }
+    }
+    for (int i = thread0; i < elems; i += stride) {
+        const int row   = i % kHeads;
+        const int token = i / kHeads;
+        float av        = 0.0f;
+        float bv        = 0.0f;
+#pragma unroll
+        for (int s = 0; s < SplitK; ++s) {
+            const std::int64_t base = (static_cast<std::int64_t>(s) * t + token) * kLogicalRows;
+            av += partial[base + row];
+            bv += partial[base + kHeads + row];
+        }
+        if constexpr (NormalizeInput) {
+            const float* norm_partial =
+                partial + static_cast<std::int64_t>(SplitK) * t * kLogicalRows;
+            float sum = 0.0F;
+#pragma unroll
+            for (int s = 0; s < SplitK; ++s) {
+                sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
+            }
+            const float inv = rsqrtf(sum / static_cast<float>(kHidden) + norm_eps);
+            av *= inv;
+            bv *= inv;
+        }
+        g[i]    = -expf(A_log[row]) * softplus(av + dt_bias[row]);
+        beta[i] = sigmoid(bv);
+    }
+}
+
 template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
           int NormTokenCapacity = 0>
 void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
@@ -270,27 +334,14 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                     static_cast<unsigned>(Geometry::kHeads / kBf16GdnBlockM),
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
-        constexpr bool FullTokens     = decltype(full_tokens)::value;
-        static const cudaError_t attr = cudaFuncSetAttribute(
+        constexpr bool FullTokens = decltype(full_tokens)::value;
+        set_max_dynamic_smem_per_device(
             bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
                                                  NormalizeInput, NormTokenCapacity>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-        CUDA_CHECK(attr);
-        if constexpr (SplitK > 1) {
-            cudaLaunchConfig_t config{};
-            config.gridDim          = grid;
-            config.blockDim         = block;
-            config.dynamicSmemBytes = kSmemBytes;
-            config.stream           = stream;
-            cudaLaunchAttribute cooperative{};
-            cooperative.id              = cudaLaunchAttributeCooperative;
-            cooperative.val.cooperative = 1;
-            config.attrs                = &cooperative;
-            config.numAttrs             = 1;
-            CUDA_CHECK(cudaLaunchKernelEx(
-                &config,
-                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                     NormalizeInput, NormTokenCapacity>,
+            kSmemBytes);
+        bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps, NormalizeInput,
+                                             NormTokenCapacity>
+            <<<grid, block, kSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
                                        : static_cast<const __nv_bfloat16*>(nullptr),
@@ -300,22 +351,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                 static_cast<const __nv_bfloat16*>(b_weight.qdata),
                 static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
                 static_cast<float*>(workspace), static_cast<float*>(g.data),
-                static_cast<float*>(beta.data), t));
-        } else {
-            bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                 NormalizeInput, NormTokenCapacity>
-                <<<grid, block, kSmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(x.data),
-                    norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
-                                           : static_cast<const __nv_bfloat16*>(nullptr),
-                    normalized_x != nullptr ? static_cast<__nv_bfloat16*>(normalized_x->data)
-                                            : static_cast<__nv_bfloat16*>(nullptr),
-                    norm_eps, static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                    static_cast<const __nv_bfloat16*>(b_weight.qdata),
-                    static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
-                    static_cast<float*>(workspace), static_cast<float*>(g.data),
-                    static_cast<float*>(beta.data), t);
-        }
+                static_cast<float*>(beta.data), t);
     };
     if (variant == Bf16GdnGatingTokenVariant::Full) {
         launch(std::true_type{});
@@ -326,6 +362,24 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
             "BF16 GDN gating MMA requires Full or Predicated token variant");
     }
     CUDA_CHECK(cudaGetLastError());
+    if constexpr (SplitK > 1) {
+        constexpr int kReduceThreads = 256;
+        const std::int32_t reduce_elems =
+            NormalizeInput ? Geometry::kHidden * t : Geometry::kHeads * t;
+        const dim3 reduce_grid(static_cast<unsigned>(div_up(reduce_elems, kReduceThreads)));
+        bf16_gdn_gating_proj_mma_reduce_kernel<Geometry, SplitK, NormalizeInput>
+            <<<reduce_grid, kReduceThreads, 0, stream>>>(
+                static_cast<const float*>(workspace),
+                static_cast<const __nv_bfloat16*>(x.data),
+                norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
+                                       : static_cast<const __nv_bfloat16*>(nullptr),
+                normalized_x != nullptr ? static_cast<__nv_bfloat16*>(normalized_x->data)
+                                        : static_cast<__nv_bfloat16*>(nullptr),
+                norm_eps, static_cast<const float*>(A_log.data),
+                static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+                static_cast<float*>(beta.data), t);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 } // namespace
@@ -396,8 +450,8 @@ void bf16_gdn_gating_proj_mma_split4_launch(Bf16GdnGatingTokenVariant variant, c
                                             void* workspace, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
     // Eight warps, matching every other MMA route in this file. At 16 warps the CTA needs 512
-    // threads' worth of registers, which admits a single CTA per sm_86 SM and collapses the
-    // cooperative budget to 82. See the residency note in the plan's route table.
+    // threads' worth of registers, which admits a single CTA per sm_86 SM and halves occupancy;
+    // eight warps keep two CTAs resident.
     launch_bf16_prefill_mma<Bf16Gdn27Geometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                      b_weight, A_log, dt_bias, workspace, g, beta,
                                                      stream);

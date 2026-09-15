@@ -29,6 +29,10 @@ constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
 
+constexpr std::string_view kHighReasoningInstructions =
+    "Reasoning effort is set to high. Please think the task through carefully, verify key "
+    "assumptions and steps, and keep the reasoning directed toward the final answer.";
+
 constexpr std::string_view kXHighReasoningInstructions =
     "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
     "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
@@ -236,6 +240,8 @@ std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
         return kLowReasoningInstructions;
     case ReasoningEffort::Medium:
         return {};
+    case ReasoningEffort::High:
+        return kHighReasoningInstructions;
     case ReasoningEffort::XHigh:
         return kXHighReasoningInstructions;
     }
@@ -296,6 +302,7 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
+        result.reasoning_effort.high           = true;
         result.reasoning_effort.xhigh          = true;
         result.reasoning_effort.default_effort = ReasoningEffort::XHigh;
     }
@@ -351,14 +358,24 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const ChatMessage& message = messages[i];
         if (i < num_sys) { continue; }
-        if (message.role == "system") {
-            throw std::invalid_argument("system message must be at the beginning");
-        }
         if (!is_allowed_role(message.role)) {
             throw std::invalid_argument("unsupported chat role: " + message.role);
         }
         const std::string content = trim_ascii_whitespace(
             message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        if (message.role == "system") {
+            if (message.has_media()) {
+                throw std::invalid_argument("system message cannot contain images or videos");
+            }
+            // Mid-conversation system turn (e.g. Claude Code per-turn reminders).
+            // Rendered in place so earlier prompt bytes stay stable for prefix reuse;
+            // hoisting these to the leading system block rewrites the prompt head on
+            // every turn and defeats KV caching entirely.
+            rendered += "<|im_start|>system\n";
+            rendered += content;
+            rendered += "<|im_end|>\n";
+            continue;
+        }
         if (message.role == "user") {
             rendered += "<|im_start|>user\n";
             rendered += content;

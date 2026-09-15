@@ -38,8 +38,10 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
 
 bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
-    return problem.input_rows == 5120 && problem.query_rows == 6144 && problem.kv_rows == 1024 &&
-           problem.padded_k == 5120;
+    // Full shape and the two-rank tensor-parallel N-split of it (halved Q/KV blocks).
+    const bool full = problem.query_rows == 6144 && problem.kv_rows == 1024;
+    const bool rank_shard = problem.query_rows == 3072 && problem.kv_rows == 512;
+    return problem.input_rows == 5120 && (full || rank_shard) && problem.padded_k == 5120;
 }
 
 } // namespace

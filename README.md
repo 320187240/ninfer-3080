@@ -1,13 +1,98 @@
-# NInfer-3090
+# NInfer-3080duo
 
-NInfer-3090 is a specialized C++20/CUDA inference engine for **Qwen3.8-27B** and Qwen3.6 on one
-24 GB NVIDIA GeForce RTX 3090. Qwen3.8-27B is a first-class, tested target: the native SM86
-runtime loads its official groupwise `.ninfer` artifact, serves OpenAI- and Anthropic-compatible
-APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP speculative decoding,
-reasoning-effort control, ReplaySSM state transactions, and concurrent cohorts through **C8**.
+NInfer-3080duo is a fork of the NInfer-3090 C++20/CUDA inference engine that runs **Qwen3.8-27B
+tensor-parallel across two consumer GPUs in one Windows process** (developed on
+3080 20 GB + 4080 16 GB, now running on 2× RTX 3080 20 GB). The 16.96 GiB groupwise
+`.ninfer` artifact is split along group-safe axes to ~8.4 GiB of weights per rank,
+per-rank CUDA Graphs execute the decode rounds, and a mapped-pinned spin transport
+(`TpLink`) carries the ~150 allreduce/argmax exchanges per round. Neither card can hold
+the model alone; together they serve the full OpenAI/Anthropic surface with a
+**262,144-token INT8 context**.
+
+Inherited single-GPU capabilities (paged KV, prefix reuse, CUDA Graphs, MTP speculative
+decoding, reasoning-effort control, ReplaySSM, bounded concurrency, vision) are unchanged
+and documented below. See [TP2 architecture](docs/maintainer/tp-architecture.md) for the
+split plan, transport measurements, and gate evidence.
 
 Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
 and feature requests are not guaranteed.
+
+## TP2 quick start
+
+Both GPUs must be visible to CUDA (the engine addresses CUDA dev0/dev1 in order; on the
+current host both are RTX 3080 20 GB).
+`--tp` enables the two-rank path; it is greedy-only (requests with temperature > 0 are
+rejected with HTTP 503 and a clear message). `--tp --vision` enables image/video input: the
+vision tower runs on rank 0 and its embeddings are broadcast to rank 1 through the TpLink
+(see [TP2 architecture](docs/maintainer/tp-architecture.md)), so vision works at moderate
+contexts — the 262,144-token profile does not fit with vision loaded (startup reports the
+exact shortfall; the 8192-token vision profile starts both ranks with ~5.3 GiB free).
+
+CLI, one greedy generation inside the full 262K context:
+
+```bat
+ninfer.exe qwen3_8_27b.ninfer --tp --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 128 --no-thinking --prompt "What is the boiling point of water at sea level? Answer in one sentence."
+```
+
+CLI, image understanding across both GPUs (`--messages` carries image parts exactly like the
+single-GPU vision profile):
+
+```bat
+ninfer.exe qwen3_8_27b.ninfer --tp --vision --max-context 8192 --kv-capacity 8192 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 64 --no-thinking --messages messages.json
+```
+
+Server with the same 262K profile (send `"temperature": 0` from clients, or add `--greedy`).
+TP serves the same bounded multi-request concurrency as single-GPU (`--max-concurrency 1-8`).
+Compatible-prefix reuse is on by default in TP mode; `--no-tp-prefix-reuse` opts out.
+
+```bat
+ninfer-serve.exe qwen3_8_27b.ninfer --tp --host 127.0.0.1 --port 8117 --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --max-concurrency 8 --spec mtp --draft-tokens 3 --lm-head-draft
+```
+
+```bash
+curl http://127.0.0.1:8117/v1/chat/completions -H "Content-Type: application/json" -d \
+  '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"What is the boiling point of water at sea level?"}],"max_tokens":64,"temperature":0}'
+```
+
+## TP2 measured results (Qwen3.8-27B, 2× RTX 3080 20 GB)
+
+| Gate | Result |
+|---|---|
+| 262,144-token INT8 startup validation | passes on both ranks, no trimming (planned slack 1.64 GiB, graphs 12 of 86 MiB) |
+| CLI MTP3 greedy decode, RDP host (code-content 1024-token generation) | 75.1 tok/s @ 86.6% MTP acceptance; ~53 tok/s on essay-content prompts @ ~61% — decode is GEMM-bound at MTP3's T≤4 shapes, so tok/s tracks content acceptance |
+| Served agentic session (Bun harness hard task, chunk 128, prefix reuse) | decode 78.4-80.3 tok/s aggregate, MTP 2.86/3 (95%), mean TTFT ~1.0-1.5 s |
+| Served agentic session prefix-cache hit rate | 91-95% of prompt tokens (was 0% before TP prefix reuse) |
+| Multi-request concurrency (`--max-concurrency 8`, MTP3, decode-saturation sweep, 2048-token waves) | aggregate steady decode 57.1 (C1) → 88.3 (C2) → 135.3 (C4) → 217.7 tok/s (C8) = 3.81×; full batch in every steady interval; `ninfer_qwen3_6_27b_tp_concurrent_test` requires token-identical greedy output across C1, C8 concurrent, and warm sequential phases |
+| Correctness spot gate ("The capital of France is") | `760 6511 314 9338 369 2972 57590 159034 248046` — token-identical with and without MTP3 |
+| Vision gate (512x512 red-square image, 8192-token profile) | answers "I see a red square." — identical to the single-GPU answer on device 1 |
+
+Previous host (3080 20 GB + 4080 16 GB) reference points: quiet-window single-generation
+decode 82.7-85.3 tok/s on code-like content; with a physical display attached under ambient
+desktop load, 39-42 tok/s (the clock-parking caveat below). The current 2×3080 host runs
+headless over RDP, where display-driven clock parking does not occur and the decode-round
+time is set by small-batch GEMM efficiency (see the decode anatomy record in the harness
+FINDINGS).
+
+### Ambient-load caveat and clock locking
+
+This caveat applies when a physical display is attached to rank 0 (the current host is
+headless/RDP and does not exhibit it). Under Windows WDDM desktop load the display GPU's SM
+clock parks (measured 780 MHz with ~58% background utilization while the peer held
+2820 MHz), and because every TP step synchronizes at each allreduce, decode in those windows
+drops to roughly half of the quiet-window rate. The original measurement host had no
+administrator access, so clocks could not be locked. In an elevated shell, locking both
+cards below max boost removes most of this variance — suggested starting points, not
+requirements:
+
+```bat
+nvidia-smi -i <rank 0 index> -lgc 1750,1750
+nvidia-smi -i <rank 1 index> -lgc 1750,1750
+```
+
+---
+
+The sections below describe the inherited single-GPU NInfer-3090 behavior, measurements, and
+packaging; on this fork they apply to the non-`--tp` path on a single installed GPU.
 
 
 
@@ -183,7 +268,7 @@ still use MTP3 as documented above.
 - A prebuilt Windows archive with tested launchers.
 - OpenAI Chat Completions, Responses, and Anthropic-compatible APIs.
 - ReplaySSM and MTP3 for higher throughput without exceeding 24 GB VRAM.
-- `low`, `medium`, and `xhigh` reasoning modes.
+- `low`, `medium`, `high`, and `xhigh` reasoning modes.
 - Qwen3.8 image understanding with ReplaySSM and MTP3.
 - Prefix reuse for faster repeated or shared prompts.
 - Qwen3.6-35B image understanding with a guarded 32K profile.
@@ -228,14 +313,16 @@ See the [Windows build guide](docs/rtx-3090-windows.md) or the
 ## Qwen3.8 reasoning effort
 
 Qwen3.8-27B supports distinct reasoning-effort modes. `medium` uses the model's normal thinking
-prompt. `xhigh` injects the checkpoint's extended deliberation instruction, asking it to validate
-assumptions and consider alternatives. This is a real prompt-template change, not a sampling alias.
+prompt. `high` injects a careful, verification-oriented instruction. `xhigh` injects the
+checkpoint's extended deliberation instruction, asking it to validate assumptions and consider
+alternatives. This is a real prompt-template change, not a sampling alias.
 
 | Value | Qwen3.8 behavior |
 |---|---|
 | `none` | Disable thinking |
 | `low` | Keep reasoning brief and focused |
 | `medium` | Use normal Qwen3.8 thinking |
+| `high` | Think the task through and verify key steps |
 | `xhigh` | Use extended deliberation and verification |
 
 OpenAI Chat Completions accepts a top-level `reasoning_effort` field:
@@ -251,7 +338,7 @@ OpenAI Chat Completions accepts a top-level `reasoning_effort` field:
 
 OpenAI Responses uses `"reasoning": {"effort": "xhigh"}`. Anthropic Messages uses
 `"output_config": {"effort": "xhigh"}`. For the native CLI, pass
-`--reasoning-effort low|medium|xhigh`; use `--no-thinking` instead of an effort to disable
+`--reasoning-effort low|medium|high|xhigh`; use `--no-thinking` instead of an effort to disable
 reasoning. Chat Completions returns hidden reasoning separately as `message.reasoning_content`.
 
 ## Serving APIs
@@ -282,12 +369,13 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 
 ## Current limits
 
-- One process owns one model on one RTX 3090.
+- One process owns one model; without `--tp` it executes on one GPU, with `--tp` it executes
+  tensor-parallel across exactly two GPUs (greedy-only).
 - Concurrency is fixed at startup and limited to 1-8 by the API; compact 35B fits C1-C6 and
   Qwen3.8-27B fits C8/8K with MTP3 through ReplaySSM.
 - The shared KV pool is fixed at startup and is not divided statically among request lanes.
 - This is bounded small-scale batching, not preemptive large-scale continuous batching.
-- No multi-GPU execution or CPU/GPU weight offload.
+- No CPU/GPU weight offload; TP beyond two ranks is not built.
 - Tool calls are returned to the client but are not executed by NInfer.
 - NVFP4 A4 and TMA kernels require Blackwell and are unavailable on SM86.
 - The paged runtime exposes BF16, INT8, and experimental opt-in `rk8v4` KV. INT8 remains the
@@ -312,6 +400,19 @@ compact 35B artifact support, and RTX 3090-specific schedules and memory plannin
 
 - [airtonix](https://github.com/airtonix) added Linux and Docker build and release support in
   [PR #1](https://github.com/Don-Chad/ninfer-3090/pull/1).
+- [ColeWheatley](https://github.com/ColeWheatley) contributed SM86 runtime-count/GDN residency
+  fixes, ECC diagnostics, and the GeForce-safe Docker fix in
+  [PR #7](https://github.com/Don-Chad/ninfer-3090/pull/7).
+- [justinlime](https://github.com/justinlime) added NixOS build support in
+  [PR #5](https://github.com/Don-Chad/ninfer-3090/pull/5).
+- [sry9681](https://github.com/sry9681) contributed the device-wide GPU-memory startup fix in
+  [PR #6](https://github.com/Don-Chad/ninfer-3090/pull/6).
+
+## Contributing
+
+Please read the [Pull Request Policy](PR_POLICY.md) before opening an issue or pull request.
+It explains how to keep changes focused and how to document correctness, performance, VRAM, and
+compatibility evidence.
 
 ## License
 

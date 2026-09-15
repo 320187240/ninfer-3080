@@ -51,7 +51,7 @@ int verify_groupwise(const std::filesystem::path& path) {
     }
     ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features());
+        bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features(), 0, false);
     if (plan.materialization.object_count != 1124 ||
         plan.materialization.device_objects.size() != 1118 ||
         plan.materialization.host_objects.size() != 6 ||
@@ -91,7 +91,7 @@ int verify_nvfp4(const std::filesystem::path& path) {
         return 1;
     }
     ninfer::artifact::Binder binder(reader);
-    const ArtifactLoadPlan plan = bind_artifact(binder, WeightsProfile::Nvfp4, all_features());
+    const ArtifactLoadPlan plan = bind_artifact(binder, WeightsProfile::Nvfp4, all_features(), 0, false);
     if (plan.materialization.object_count != 1307 ||
         plan.materialization.device_objects.size() != 1054 ||
         plan.materialization.host_objects.size() != 6 ||

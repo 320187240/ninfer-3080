@@ -237,6 +237,13 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
         launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
         return;
     }
+    if (records.spec.layers == FoldGeometry48x24Tp::kLayers &&
+        records.spec.qk_heads == FoldGeometry48x24Tp::kQkHeads &&
+        records.spec.value_heads == FoldGeometry48x24Tp::kValueHeads &&
+        records.spec.conv_channels == FoldGeometry48x24Tp::kConvChannels) {
+        launch_replay_fold_fixed<FoldGeometry48x24Tp>(records, states, rows, active_rows, stream);
+        return;
+    }
     if (records.spec.layers == FoldGeometry30x32::kLayers &&
         records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
         records.spec.value_heads == FoldGeometry30x32::kValueHeads &&

@@ -6,18 +6,19 @@
 //   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
 //
 // A CTA computes the same 16 output rows from both weights over 128 (27B) or
-// 64 (35B) tokens.
-// Split-K routes use a tuned eight- or sixteen-warp specialization and an
-// in-kernel cooperative grid reduction; the unsplit long-context route uses
-// eight warps for more independent MMA accumulators. Both preserve a single
-// kernel launch.
+// 64 (35B) tokens. Split-K routes write per-split FP32 partials and a second
+// plain reduce kernel folds them into g/beta, so no route carries a
+// cooperative-residency constraint (a cooperative launch requires the whole
+// grid simultaneously resident, which competing display load on a WDDM host
+// can shrink below the static budget and the driver then rejects the launch);
+// the unsplit long-context route writes g/beta directly with eight warps for
+// more independent MMA accumulators.
 
 #include "ops/common/math.cuh"
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
-#include <cooperative_groups.h>
 
 #include <cstdint>
 
@@ -292,61 +293,6 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
         }
     }
 
-    if constexpr (SplitK > 1) {
-        cooperative_groups::this_grid().sync();
-        const int block_linear = (static_cast<int>(blockIdx.z) * static_cast<int>(gridDim.y) +
-                                  static_cast<int>(blockIdx.y)) *
-                                     static_cast<int>(gridDim.x) +
-                                 static_cast<int>(blockIdx.x);
-        const int grid_threads = static_cast<int>(gridDim.x) * static_cast<int>(gridDim.y) *
-                                 static_cast<int>(gridDim.z) * kThreads;
-        const int elems = kBf16GdnHeads * t;
-        if constexpr (NormalizeInput) {
-            const float* norm_partial =
-                partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
-            const int hidden_elems = kBf16GdnHidden * t;
-            for (int i = block_linear * kThreads + tid; i < hidden_elems; i += grid_threads) {
-                const int k     = i % kBf16GdnHidden;
-                const int token = i / kBf16GdnHidden;
-                float sum       = 0.0F;
-#pragma unroll
-                for (int s = 0; s < SplitK; ++s) {
-                    sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
-                }
-                const float inv    = rsqrtf(sum / static_cast<float>(kBf16GdnHidden) + norm_eps);
-                const float value  = __bfloat162float(x[i]);
-                const float weight = __bfloat162float(norm_weight[k]);
-                normalized_x[i]    = __float2bfloat16_rn(value * inv * (1.0F + weight));
-            }
-        }
-        for (int i = block_linear * kThreads + tid; i < elems; i += grid_threads) {
-            const int row   = i % kBf16GdnHeads;
-            const int token = i / kBf16GdnHeads;
-            float av        = 0.0f;
-            float bv        = 0.0f;
-#pragma unroll
-            for (int s = 0; s < SplitK; ++s) {
-                const std::int64_t base =
-                    (static_cast<std::int64_t>(s) * t + token) * kBf16GdnLogicalRows;
-                av += partial[base + row];
-                bv += partial[base + kBf16GdnHeads + row];
-            }
-            if constexpr (NormalizeInput) {
-                const float* norm_partial =
-                    partial + static_cast<std::int64_t>(SplitK) * t * kBf16GdnLogicalRows;
-                float sum = 0.0F;
-#pragma unroll
-                for (int s = 0; s < SplitK; ++s) {
-                    sum += norm_partial[static_cast<std::int64_t>(s) * t + token];
-                }
-                const float inv = rsqrtf(sum / static_cast<float>(kBf16GdnHidden) + norm_eps);
-                av *= inv;
-                bv *= inv;
-            }
-            g[i]    = -expf(A_log[row]) * softplus(av + dt_bias[row]);
-            beta[i] = sigmoid(bv);
-        }
-    }
 }
 
 } // namespace ninfer::ops::detail

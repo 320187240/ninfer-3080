@@ -34,6 +34,11 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+    // GDN a/b control head rows the schedule stages beyond the recipe's shard-shaped g/beta
+    // and holds live across the GDN core; zero on one GPU (the recipe outputs are the
+    // projection targets). The two-rank TP variant sets the duplicated full-width head
+    // count because its control kernels are fixed to the registered whole-model heads.
+    static constexpr std::int32_t gdn_control_full_width_heads = 0;
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

@@ -15,6 +15,8 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 
+#include "targets/qwen3_6/impl/runtime/tp_exec.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -169,6 +171,11 @@ public:
         proposal_head_n_   = count;
     }
 
+    // Two-rank tensor-parallel execution: null (the default) keeps every schedule on the
+    // single-GPU path; a non-null context routes row-parallel leaves, the embedding lookup,
+    // and greedy sampling through the per-rank TpLink exchanges.
+    void set_tp(TpExec* tp) noexcept { tp_ = tp; }
+
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
     void set_prefill_turn_checkpoint_frontier(std::int64_t position) noexcept {
@@ -315,6 +322,7 @@ private:
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const Weight* lm_head_                      = nullptr;
+    TpExec* tp_                                 = nullptr;
     const Weight* proposal_head_                = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;

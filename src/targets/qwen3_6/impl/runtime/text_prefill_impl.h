@@ -61,6 +61,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    card.set_tp(state.execution.tp);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
@@ -89,6 +90,7 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    card.set_tp(state.execution.tp);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.turn_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_turn_checkpoint_hidden_output(state.turn_checkpoint_hidden);
@@ -148,9 +150,17 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
-    ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
-                state.execution.io.pos, purpose, state.execution.work,
-                state.execution.device.stream);
+    if (state.execution.tp != nullptr) {
+        // TP is greedy-only: the vocab-parallel argmax reduce over this rank's head slice is
+        // the sampling path (as in the TextContext prefill tail); token_domain exceeds the
+        // shard logits rows, so the full-vocab ops::sample does not apply here.
+        tp_argmax_sample(*state.execution.tp, logits, state.execution.io.token,
+                         state.execution.device.stream);
+    } else {
+        ops::sample(logits, state.execution.io.token, TextConfig::token_domain, state.sampling,
+                    state.execution.io.pos, purpose, state.execution.work,
+                    state.execution.device.stream);
+    }
     state.execution.work.reset();
 }
 

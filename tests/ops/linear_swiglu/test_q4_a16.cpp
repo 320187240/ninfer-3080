@@ -17,8 +17,16 @@ int main() {
         const int failures = run_profile(
             "LinearSwiGLU Q4_A16",
             {QType::Q4G64_F16S, 34816, 5120, 17408, 1401U, ActivationCompute::A16}, kTokenCases);
-        std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q4_A16 correctness\n";
-        return failures == 0 ? 0 : 1;
+        // Two-rank tensor-parallel N-split: gate_up [17408,5120], output 8704. The rank output
+        // is the corresponding row block of the full-shape result because gate/up pairing and
+        // SwiGLU are row-independent; this case is verified against the same independent oracle.
+        constexpr std::array<std::int32_t, 10> kTpTokenCases{1, 2, 32, 33, 48, 49, 128, 129, 256, 641};
+        const int tp_failures = run_profile(
+            "LinearSwiGLU Q4_A16 TP",
+            {QType::Q4G64_F16S, 17408, 5120, 8704, 1423U, ActivationCompute::A16}, kTpTokenCases);
+        std::cout << ((failures + tp_failures) == 0 ? "OK" : "FAIL")
+                  << " LinearSwiGLU Q4_A16 correctness\n";
+        return (failures + tp_failures) == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "LinearSwiGLU Q4_A16 test failed: " << error.what() << '\n';
         return 1;

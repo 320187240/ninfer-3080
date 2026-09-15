@@ -302,6 +302,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    if (plan.defer_graph_capture) {
+        // The two-rank TP coordinator prepares graphs itself once the per-rank seams exist.
+        return;
+    }
+    prepare_program_graphs();
+}
+
+void ProgramImplCore::prepare_program_graphs() {
     device.synchronize();
     prepare_graphs();
     work.reset();
@@ -311,6 +319,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+}
+
+void ProgramImplCore::synchronize_round() {
+    if (round_sync_handler_ != nullptr) {
+        round_sync_handler_(round_sync_context_);
+        return;
+    }
+    device.synchronize();
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -575,7 +591,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         auto& staged = *request.prefill;
         if (staged.vision_plan) {
             staged.vision = std::make_unique<schedule::VisionPrefillSession>(
-                device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
+                device, model, work, staged.prompt, *staged.vision_plan, staged.transient,
+                tp_exec_);
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle      = Lifecycle::Prefilling;
@@ -619,7 +636,9 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 throw std::logic_error("ordinary pending batch no longer matches Program state");
             }
             if (cancelled[row]) {
-                clear_lane(sequences[lane], requests[lane]);
+                // The cancelled row's committed watermark is licensed state: park it as a
+                // retained prefix (same semantics as abort_lane) so the retry resumes there.
+                retain_cancelled_lane_(lane);
             } else {
                 resolve_non_speculative_pending(sequences[lane], requests[lane],
                                                 accepted_tokens[row], terminal[row] != 0);
@@ -747,7 +766,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             SequenceState& sequence = sequences[lanes[row]];
             RequestControl& request = requests[lanes[row]];
             if (cancelled[row]) {
-                clear_lane(sequence, request);
+                // The batch-wide fold above already rolled this row's GDN state back to the
+                // round base (commit_columns == 0), so the committed watermark is consistent:
+                // park it as a retained prefix for the retry instead of discarding it.
+                retain_cancelled_lane_(lanes[row]);
                 continue;
             }
 
@@ -803,7 +825,87 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
 
 void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
-    clear_lane(sequences[lane], requests[lane]);
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    // An unresolved speculative round advanced the lane's GDN slot past the watermark (verify
+    // consumed the draft columns); fold it back to the round base with commit_columns == 0,
+    // the same correction resolve_pending_batch applies to a cancelled row.
+    if (request.pending.kind == PendingKind::Speculative && request.pending.produced != 0) {
+        try {
+            if (!replay_records) { throw std::logic_error("speculative abort has no replay records"); }
+            const ops::GdnReplayFoldRow fold_row{
+                .linear_state_slot = LinearStateSlots::current_state_slot(lane, max_concurrency),
+                .commit_columns    = 0,
+            };
+            ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
+                                 std::span<const ops::GdnReplayFoldRow>(&fold_row, 1),
+                                 device.stream);
+        } catch (...) {
+            request.prefill.reset();
+            clear_lane(sequence, request);
+            return;
+        }
+    }
+    request.prefill.reset();
+    retain_cancelled_lane_(lane);
+}
+
+// Parks one cancelled lane's committed watermark as a retained prefix: every token below
+// text_kv_valid has licensed KV, ledger, identity, and (post-fold) GDN state, so the retry of
+// the identical prompt resumes at the watermark instead of re-prefilling from zero — the same
+// retain semantics as a partial terminal commit, applied to the cancel boundary. State beyond
+// the watermark is dropped. Returns false (lane cleared) when the watermark cannot be made
+// reusable; the caller decides whether that is fatal. Requires the lane's GDN slot to already
+// be consistent with the watermark (no unresolved speculative extent).
+bool ProgramImplCore::retain_cancelled_lane_(std::uint32_t lane) noexcept {
+    SequenceState& sequence = sequences[lane];
+    RequestControl& request = requests[lane];
+    const std::uint32_t reusable = sequence.text_kv_valid;
+    const bool backend_ready =
+        speculative_backend == SpeculativeBackend::Mtp
+            ? sequence.mtp_kv_valid >= reusable
+            : speculative_backend == SpeculativeBackend::DFlash
+                  ? sequence.dflash_context_frontier >= reusable
+                  : true;
+    const bool retainable =
+        sequence.kv.has_value() && reusable != 0 && backend_ready &&
+        sequence.prefix_identity.size() >= reusable &&
+        sequence.ledger.size() >= reusable;
+    if (!retainable) {
+        clear_lane(sequence, request);
+        return false;
+    }
+    try {
+        sequence.prefix_identity.truncate(reusable);
+    } catch (...) {
+        clear_lane(sequence, request);
+        return false;
+    }
+    unbind_sequence_kv(sequence);
+    sequence.mtp_kv_valid            = std::min(sequence.mtp_kv_valid, reusable);
+    sequence.dflash_context_frontier = std::min(sequence.dflash_context_frontier, reusable);
+    try {
+        release_sequence_growth_entitlement(sequence);
+        trim_sequence_kv(sequence, reusable, backend_kv_valid(sequence));
+    } catch (...) {
+        // noexcept park: the KV bundle is not reclaimable in this error state, so release the
+        // whole resident state rather than leave a half-trimmed lane.
+        sequence.kv.reset();
+        clear_lane(sequence, request);
+        return false;
+    }
+    sequence.ledger.resize(reusable);
+    sequence.execution_frontier = reusable;
+    sequence.ledger_frontier    = reusable;
+    sequence.text_kv_valid      = reusable;
+    sequence.mtp_draft_count    = 0;
+    if (!sequence.turn_checkpoint.valid || sequence.turn_checkpoint.frontier > reusable) {
+        sequence.turn_checkpoint = {};
+    }
+    sequence.retained = true;
+    request.lifecycle = Lifecycle::Complete;
+    request.pending   = {};
+    return true;
 }
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
@@ -813,6 +915,44 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+}
+
+qwen3_6::detail::RetentionDigest
+ProgramImplCore::sequence_retention_digest(std::uint32_t lane) const {
+    if (lane >= max_concurrency) { throw std::out_of_range("digest lane is out of range"); }
+    const SequenceState& sequence = sequences[lane];
+    qwen3_6::detail::RetentionDigest digest;
+    digest.retained                     = sequence.retained;
+    digest.tail_hidden_valid            = sequence.tail_hidden_valid;
+    digest.execution_frontier           = sequence.execution_frontier;
+    digest.ledger_frontier              = sequence.ledger_frontier;
+    digest.ledger_size  = static_cast<std::uint32_t>(sequence.ledger.size());
+    digest.ledger_hash  = qwen3_6::detail::retention_fnv1a(
+        sequence.ledger.data(), sequence.ledger.size() * sizeof(TokenId));
+    digest.identity_hash = sequence.prefix_identity.content_digest();
+    digest.identity_size = sequence.prefix_identity.size();
+    digest.rope_delta    = sequence.rope_delta;
+    digest.text_kv_valid = sequence.text_kv_valid;
+    digest.mtp_kv_valid  = sequence.mtp_kv_valid;
+    digest.dflash_context_frontier = sequence.dflash_context_frontier;
+    digest.checkpoint_valid        = sequence.turn_checkpoint.valid;
+    digest.checkpoint_frontier     = sequence.turn_checkpoint.frontier;
+    digest.mtp_drafts_hash         = qwen3_6::detail::retention_fnv1a(
+        sequence.mtp_drafts.data(), sequence.mtp_draft_count * sizeof(TokenId));
+    digest.mtp_draft_count = sequence.mtp_draft_count;
+    if (sequence.kv) {
+        digest.kv_valid              = true;
+        digest.text_page_count       = sequence.kv->text.mapped_page_count();
+        digest.text_page_entitlement = sequence.kv->text.page_entitlement();
+        digest.text_bound_row        = sequence.kv->text.bound_row();
+        const std::span<const std::int32_t> pages = sequence.kv->text.page_ids();
+        digest.text_pages_hash       = qwen3_6::detail::retention_fnv1a(
+            pages.data(), pages.size() * sizeof(std::int32_t));
+        if (sequence.kv->backend) {
+            digest.backend_page_count = sequence.kv->backend->mapped_page_count();
+        }
+    }
+    return digest;
 }
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
@@ -1186,7 +1326,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       tp_exec_};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1493,7 +1634,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, tp_exec_},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1575,6 +1716,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
+                // Park the chunk's last hidden in the lane's tail slot: an abort at the next
+                // boundary retains the watermark prefix, and the append-resume MTP bridge (or
+                // a zero-suffix sample) needs the hidden of the last resident token.
+                copy_tail(sequence, prefill_hidden.slice(
+                                          1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+                synchronize_round();
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{.summary = summary,
@@ -1620,7 +1767,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
-        device.synchronize();
+        synchronize_round();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<std::uint32_t> turn_checkpoint_capture_frontier =
@@ -1754,7 +1901,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, tp_exec_},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -1764,7 +1911,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
-        device.synchronize();
+        synchronize_round();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1885,7 +2032,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  tp_exec_},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -1896,7 +2044,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
-        device.synchronize();
+        synchronize_round();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {

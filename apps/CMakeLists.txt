@@ -9,6 +9,9 @@ target_link_libraries(ninfer PRIVATE
   ninfer_engine
   ninfer_product_load_progress
   ninfer_product_prompt_input)
+if(WIN32)
+  target_link_libraries(ninfer PRIVATE Shell32)
+endif()
 
 add_executable(ninfer-serve serve/main.cpp)
 target_include_directories(ninfer-serve PRIVATE

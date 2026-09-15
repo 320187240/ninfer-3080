@@ -24,6 +24,20 @@ int q5_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kK17408RouteInteriors});
+
+    // Two-rank tensor-parallel K-splits of the two registered shapes: o_proj/GDN out_proj
+    // [5120,3072] and mlp down [5120,8704]. Each shard is checked directly against the same
+    // independent oracle, so the two rank partials add to the full-shape output.
+    constexpr std::array<std::int32_t, 5> kK3072RouteStarts{2, 14, 33, 49, 129};
+    constexpr std::array<std::int32_t, 6> kK3072RouteInteriors{1, 8, 24, 40, 96, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd TP", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 3072, 419U, kK3072RouteStarts, kK3072RouteInteriors});
+    constexpr std::array<std::int32_t, 4> kK8704RouteStarts{2, 33, 49, 129};
+    constexpr std::array<std::int32_t, 6> kK8704RouteInteriors{1, 8, 24, 40, 96, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd TP", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 8704, 421U, kK8704RouteStarts, kK8704RouteInteriors});
     return failures;
 }
 

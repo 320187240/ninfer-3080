@@ -577,9 +577,17 @@ int main() {
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
 
+    // Two-rank tensor-parallel GDN geometry: 8 K-heads, 24 V-heads (group 3). Per-head
+    // recurrence is independent, so each rank's head block matches the same FP64 oracle.
+    failures += inplace_case({"tp decode fused-qk-norm", 8, 24, 1, true}, 12401u);
+    failures += distinct_state_case({"tp raw-qk small-T", 8, 24, 7, false}, 12407u);
+    failures += distinct_state_case({"tp exact chunk fused-qk-norm", 8, 24, 64, true}, 12464u);
+    failures += distinct_state_case({"tp two-chunk fused-qk-norm", 8, 24, 128, true}, 12428u);
+
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.
     failures += snapshot_case({"27b verify fused-qk-norm", 16, 48, 4, true}, 8, 7, 1, 12104u);
+    failures += snapshot_case({"tp verify fused-qk-norm", 8, 24, 4, true}, 8, 7, 1, 12504u);
     failures += snapshot_case({"35b verify fused-qk-norm near-zero", 16, 32, 4, true, true}, 8, 6,
                               1, 12204u);
     failures +=

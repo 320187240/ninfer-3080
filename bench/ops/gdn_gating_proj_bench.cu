@@ -104,11 +104,11 @@ ops::detail::Bf16GdnGatingScheduleId parse_candidate(std::string_view raw) {
     using S = ops::detail::Bf16GdnGatingScheduleId;
     if (raw == "simt-c4") { return S::SimtWarpRowC4; }
     if (raw == "simt-c8") { return S::SimtWarpRowC8; }
-    if (raw == "mma-split32") { return S::MmaCooperativeSplit32; }
-    if (raw == "mma-split16") { return S::MmaCooperativeSplit16; }
-    if (raw == "mma-split8") { return S::MmaCooperativeSplit8; }
-    if (raw == "mma-split4") { return S::MmaCooperativeSplit4; }
-    if (raw == "mma-split2") { return S::MmaCooperativeSplit2; }
+    if (raw == "mma-split32") { return S::MmaSplit32; }
+    if (raw == "mma-split16") { return S::MmaSplit16; }
+    if (raw == "mma-split8") { return S::MmaSplit8; }
+    if (raw == "mma-split4") { return S::MmaSplit4; }
+    if (raw == "mma-split2") { return S::MmaSplit2; }
     if (raw == "mma-unsplit") { return S::MmaUnsplit; }
     throw std::invalid_argument("unknown candidate: " + std::string(raw));
 }

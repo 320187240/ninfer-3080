@@ -238,6 +238,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
                               hidden, g, beta, stream);
 }
 
+
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();

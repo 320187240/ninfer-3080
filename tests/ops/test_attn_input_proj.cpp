@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <span>
 #include <string>
@@ -79,6 +80,43 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     return failures;
 }
 
+int run_q4_q5_tp_shard_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value,
+                            std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kQRows       = 3072;
+    constexpr std::int32_t kKvRows      = 512;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 127U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " Q4/Q5 TP A16 T=" + std::to_string(tokens);
+    int failures             = 0;
+    failures += verify_output("attn q" + suffix, query, query_key.host, 0, kQRows, activation,
+                              kHidden, tokens);
+    failures += verify_output("attn k" + suffix, key, query_key.host, kQRows, kKvRows, activation,
+                              kHidden, tokens);
+    failures += verify_output("attn gate" + suffix, gate, gate_value.host, 0, kQRows, activation,
+                              kHidden, tokens);
+    failures += verify_output("attn value" + suffix, value, gate_value.host, kQRows, kKvRows,
+                              activation, kHidden, tokens);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += query_key.verify_preserved("attn query/key" + suffix);
+    failures += gate_value.verify_preserved("attn gate/value" + suffix);
+    return failures;
+}
+
 int run_q4_q5() {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kParent = 7168;
@@ -90,6 +128,23 @@ int run_q4_q5() {
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
+    }
+    return failures;
+}
+
+// Two-rank tensor-parallel rank shard of the Q4/Q5 payload: query_key/gate_value rows
+// [3584,5120] with a 3072/512 q-vs-kv seam. Verified against the same independent oracle.
+int run_q4_q5_tp_shard() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kParent = 3584;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 109U));
+    DevicePackedWeight gate_value(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 113U));
+
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 8, 16, 17, 21, 128, 1024}) {
+        failures += run_q4_q5_tp_shard_case(query_key, gate_value, tokens);
     }
     return failures;
 }
@@ -300,9 +355,11 @@ int run_nvfp4_target() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 20, 32, 33}) {
         failures += run_nvfp4_target_case(parent, tokens);
     }
+#ifndef NINFER_SM8X_COMPAT
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+#endif
     return failures;
 }
 
@@ -404,11 +461,17 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_q4_q5();
-    failures += run_bf16_target();
-    failures += run_nvfp4_target();
-    failures += run_w8_target();
-    failures += run_w8_companion();
+    try {
+        failures += run_q4_q5();
+        failures += run_q4_q5_tp_shard();
+        failures += run_bf16_target();
+        failures += run_nvfp4_target();
+        failures += run_w8_target();
+        failures += run_w8_companion();
+    } catch (const std::exception& error) {
+        std::cerr << "unexpected exception: " << error.what() << '\n';
+        return 1;
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
 }

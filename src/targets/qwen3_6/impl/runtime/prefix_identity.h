@@ -23,6 +23,10 @@ public:
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
 
+    // Order-independent content fingerprint (token types, all MRoPE axes, vision items) used by
+    // the TP retention coordinator to detect cross-rank state divergence.
+    [[nodiscard]] std::uint64_t content_digest() const;
+
 private:
     std::vector<std::uint8_t> token_types_;
     std::array<std::vector<std::int32_t>, 3> positions_;

@@ -7,6 +7,16 @@
 namespace ninfer::targets::qwen3_6::detail {
 namespace {
 
+// FNV-1a over raw bytes; must stay consistent with tp_retention.h's shared builder.
+std::uint64_t fold_bytes(std::uint64_t hash, const void* data, std::size_t bytes) {
+    const auto* bytes8 = static_cast<const unsigned char*>(data);
+    for (std::size_t index = 0; index < bytes; ++index) {
+        hash ^= bytes8[index];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {
     return left.temporal == right.temporal && left.height == right.height &&
            left.width == right.width;
@@ -110,6 +120,29 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     token_types_.resize(tokens);
     for (auto& axis : positions_) { axis.resize(tokens); }
     vision_items_.resize(retained_items);
+}
+
+std::uint64_t ResidentPrefixIdentity::content_digest() const {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    hash = fold_bytes(hash, token_types_.data(), token_types_.size());
+    for (const std::vector<std::int32_t>& axis : positions_) {
+        hash = fold_bytes(hash, axis.data(), axis.size() * sizeof(std::int32_t));
+    }
+    for (const VisionItem& item : vision_items_) {
+        hash              = fold_bytes(hash, &item.modality, sizeof(item.modality));
+        hash              = fold_bytes(hash, &item.grid, sizeof(item.grid));
+        hash              = fold_bytes(hash, &item.patch_begin, sizeof(item.patch_begin));
+        hash              = fold_bytes(hash, &item.patch_count, sizeof(item.patch_count));
+        hash              = fold_bytes(hash, item.content_digest.data(),
+                                       item.content_digest.size());
+        for (double timestamp : item.timestamps) {
+            hash = fold_bytes(hash, &timestamp, sizeof(timestamp));
+        }
+        for (const TokenSpan& span : item.token_spans) {
+            hash = fold_bytes(hash, &span, sizeof(span));
+        }
+    }
+    return hash;
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {

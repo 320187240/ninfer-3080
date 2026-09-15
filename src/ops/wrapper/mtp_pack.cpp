@@ -55,18 +55,20 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     require_bf16_contiguous_nonnull(v, op, "v");
     const std::int32_t tokens = attn_in.ne[1];
     if (tokens <= 0) { throw std::invalid_argument("mtp_split_attn_in: T must be positive"); }
-    require_shape(attn_in, 14336, tokens, op, "attn_in");
-    if (q.ne[0] != 256 || q.ne[1] != 24 || q.ne[2] != tokens || q.ne[3] != 1) {
-        throw std::invalid_argument("mtp_split_attn_in: invalid shape for q");
+    if (attn_in.ne[2] != 1 || attn_in.ne[3] != 1) {
+        throw std::invalid_argument("mtp_split_attn_in: invalid shape for attn_in");
     }
-    if (k.ne[0] != 256 || k.ne[1] != 4 || k.ne[2] != tokens || k.ne[3] != 1) {
-        throw std::invalid_argument("mtp_split_attn_in: invalid shape for k");
-    }
-    if (gate.ne[0] != 256 || gate.ne[1] != 24 || gate.ne[2] != tokens || gate.ne[3] != 1) {
-        throw std::invalid_argument("mtp_split_attn_in: invalid shape for gate");
-    }
-    if (v.ne[0] != 256 || v.ne[1] != 4 || v.ne[2] != tokens || v.ne[3] != 1) {
-        throw std::invalid_argument("mtp_split_attn_in: invalid shape for v");
+    // Registered geometries: the full 27B projection [q 6144 | k 1024 | gate 6144 | v 1024]
+    // and the two-rank shard halves [3072 | 512 | 3072 | 512]. Boundaries derive from the
+    // concrete q/kv row counts so both domains share one exact index remap.
+    const std::int32_t q_rows   = q.ne[0] * q.ne[1];
+    const std::int32_t kv_rows  = k.ne[0] * k.ne[1];
+    if (q.ne[2] != tokens || q.ne[3] != 1 || gate.ne[2] != tokens || gate.ne[3] != 1 ||
+        k.ne[2] != tokens || k.ne[3] != 1 || v.ne[2] != tokens || v.ne[3] != 1 ||
+        gate.ne[0] != q.ne[0] || gate.ne[1] != q.ne[1] || v.ne[0] != k.ne[0] ||
+        v.ne[1] != k.ne[1] || attn_in.ne[0] != 2 * (q_rows + kv_rows) ||
+        (attn_in.ne[0] != 14336 && attn_in.ne[0] != 7168) || q.ne[0] != 256 || k.ne[0] != 256) {
+        throw std::invalid_argument("mtp_split_attn_in: invalid shape for the mtp attention split");
     }
 
     detail::mtp_split_attn_in_launch(attn_in, q, k, gate, v, stream);

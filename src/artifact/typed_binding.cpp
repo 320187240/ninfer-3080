@@ -112,12 +112,13 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
 } // namespace
 
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
-                         std::initializer_list<std::uint64_t> shape, TensorPlacement placement) {
+                         std::initializer_list<std::uint64_t> shape, TensorPlacement placement,
+                         const TensorSlice* slice) {
     const ObjectHandle handle =
         binder.require_tensor(name, format, storage_layout_for(format),
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
-        binder.materialize_on_device(handle);
+        binder.materialize_on_device(handle, slice == nullptr ? TensorSlice{} : *slice);
     } else {
         binder.validate_only(handle);
     }
@@ -125,8 +126,9 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
 }
 
 ObjectHandle bind_device_tensor(Binder& binder, std::string_view name, NumericFormat format,
-                                std::initializer_list<std::uint64_t> shape) {
-    return bind_tensor(binder, name, format, shape, TensorPlacement::Device);
+                                std::initializer_list<std::uint64_t> shape,
+                                const TensorSlice* slice) {
+    return bind_tensor(binder, name, format, shape, TensorPlacement::Device, slice);
 }
 
 ObjectHandle bind_raw_resource(Binder& binder, std::string_view name) {

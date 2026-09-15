@@ -21,6 +21,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
+    resolved.execution.tp_prefix_reuse         = options.execution.tp_prefix_reuse;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     return resolved;
@@ -121,8 +122,10 @@ class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using ExecutorTp = runtime::ConcurrentExecutor<targets::Qwen3_6_27BTpInstance>;
     using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>,
+                     std::unique_ptr<ExecutorTp>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -136,6 +139,8 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options);
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BTpInstance>) {
+                    return std::make_unique<ExecutorTp>(*target_ptr, options);
                 } else {
                     return std::make_unique<Executor35>(*target_ptr, options);
                 }

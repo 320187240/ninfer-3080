@@ -2,8 +2,6 @@
 
 #include "ninfer/ops/rmsnorm.h"
 
-#include <cuda_runtime_api.h>
-
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -31,24 +29,23 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // sm_86 has 64 Ki registers and 100 KiB of shared memory per SM. Every MMA route runs
-    // 8 warps at 65 registers, so 8*32*72 = 18,432 registers admits three CTAs/SM while the 40 KiB
-    // of dynamic shared memory admits two. Shared memory binds: 2 CTAs/SM -> 164 device-wide.
-    // Grid is ceil(T/128)*3*SplitK, so the legal ends are 768 / 1664 / 3456.
-    {{9, 768}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{769, 1664}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{1665, 3456}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    // The split-width crossovers were first delimited by the old cooperative-launch residency
+    // budgets; with split-K reduction moved to a plain second kernel no route carries a
+    // residency constraint, and the boundaries are retained as the measured tuning points.
+    // Grid is ceil(T/128)*3*SplitK.
+    {{9, 768}, Bf16GdnGatingScheduleId::MmaSplit8},
+    {{769, 1664}, Bf16GdnGatingScheduleId::MmaSplit4},
+    {{1665, 3456}, Bf16GdnGatingScheduleId::MmaSplit2},
     {{3457, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 constexpr std::array<RouteSpec, 5> k35Routes{{
-    // Same progression, clamped to the sm_86 residency ceilings. Grid is ceil(T/64)*2*SplitK, so
-    // with 328 CTAs for split16 and 246 for split8/4/2 the legal ends are 640 / 960 / 1920 / 3904.
-    // The upstream bounds (1024 / 2048 / 4096) each land on 256 CTAs and exceed the 246 limit.
-    {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, 960}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{961, 1920}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{1921, 3904}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    // Same progression for the 35B geometry. Grid is ceil(T/64)*2*SplitK; as above the split
+    // boundaries are retained tuning points, not residency limits.
+    {{1, 127}, Bf16GdnGatingScheduleId::MmaSplit16},
+    {{128, 960}, Bf16GdnGatingScheduleId::MmaSplit8},
+    {{961, 1920}, Bf16GdnGatingScheduleId::MmaSplit4},
+    {{1921, 3904}, Bf16GdnGatingScheduleId::MmaSplit2},
     {{3905, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
@@ -66,108 +63,6 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
-// Per-SM resident-CTA occupancy, measured on the sm_86 build with cuobjdump -res-usage. These are
-// the single source of truth: both the runtime residency predicates and the compile-time catalog
-// guard below read them, so a retuned constant cannot silently disagree with the route table it is
-// meant to bound.
-//
-// Occupancy is a property of the compiled kernel (registers, shared memory, block size) and so is
-// fixed for a given sm_86 build. The device-wide budget is this figure times the SM count, which is
-// NOT fixed across sm_86: the RTX 3090 has 82 SMs and the RTX 3090 Ti has 84. Keep the two separate
-// -- multiply by the runtime SM count for the residency predicate, and by the minimum supported SM
-// count for the compile-time guard.
-constexpr std::int32_t ctas_per_sm_27(Bf16GdnGatingScheduleId) noexcept {
-    // Uniform across split8/4/2: all three are 8-warp, 65-register CTAs bounded by the same 40 KiB
-    // shared-memory allocation, so all three admit two CTAs per SM.
-    return 2;
-}
-
-constexpr std::int32_t ctas_per_sm_35(Bf16GdnGatingScheduleId schedule) noexcept {
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32) { return 2; }
-    if (schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit16) { return 4; }
-    return 3;
-}
-
-// Fewest SMs of any device this build supports. The RTX 3090 is the smallest sm_86 part the fork
-// targets, so the compile-time catalog guard is checked against it: a route that fits on 82 SMs
-// fits on every supported device. Overshooting the real budget is not merely slow -- the driver
-// rejects the launch with cudaErrorCooperativeLaunchTooLarge -- so this must stay a lower bound.
-inline constexpr std::int32_t kMinSupportedSmCount = 82;
-
-// Cached SM count of the active device. cudaDeviceGetAttribute is cheap but this sits on the
-// per-request planning path, so read it once. Falling back to the documented minimum keeps the
-// predicate safe if the query ever fails.
-std::int32_t device_sm_count() noexcept {
-    static const std::int32_t count = [] {
-        int device = 0;
-        if (cudaGetDevice(&device) != cudaSuccess) { return kMinSupportedSmCount; }
-        int sms = 0;
-        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
-            sms <= 0) {
-            return kMinSupportedSmCount;
-        }
-        return static_cast<std::int32_t>(sms);
-    }();
-    return count;
-}
-
-std::int32_t resident_ctas_27(Bf16GdnGatingScheduleId schedule) noexcept {
-    return ctas_per_sm_27(schedule) * device_sm_count();
-}
-
-std::int32_t resident_ctas_35(Bf16GdnGatingScheduleId schedule) noexcept {
-    return ctas_per_sm_35(schedule) * device_sm_count();
-}
-
-// Zero marks a schedule that is not launched cooperatively and therefore carries no residency
-// constraint at all.
-constexpr std::int32_t cooperative_split_k(Bf16GdnGatingScheduleId schedule) noexcept {
-    switch (schedule) {
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        return 32;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        return 16;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        return 8;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        return 4;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        return 2;
-    default:
-        return 0;
-    }
-}
-
-// A cooperative launch requires the entire grid to be simultaneously resident. A route whose upper
-// bound exceeds the budget is not merely slow: the driver rejects the launch outright with
-// cudaErrorCooperativeLaunchTooLarge on the first prefill wide enough to reach it. Checking the
-// catalog at compile time turns that class of regression into a build failure.
-template <std::size_t N, typename Budget>
-constexpr bool catalog_is_resident(const std::array<RouteSpec, N>& routes, std::int32_t tile_cols,
-                                   std::int32_t row_tiles, Budget budget) noexcept {
-    for (const RouteSpec& route : routes) {
-        const std::int32_t split_k = cooperative_split_k(route.schedule);
-        if (split_k == 0) { continue; }
-        const std::int64_t column_tiles =
-            (static_cast<std::int64_t>(route.cols.last) + tile_cols - 1) / tile_cols;
-        if (column_tiles * row_tiles * split_k > budget(route.schedule)) { return false; }
-    }
-    return true;
-}
-
-static_assert(catalog_is_resident(k27Routes, 128, 3,
-                                  [](Bf16GdnGatingScheduleId schedule) constexpr noexcept {
-                                      return ctas_per_sm_27(schedule) * kMinSupportedSmCount;
-                                  }),
-              "a 27B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound "
-              "on the smallest supported device");
-static_assert(catalog_is_resident(k35Routes, 64, 2,
-                                  [](Bf16GdnGatingScheduleId schedule) constexpr noexcept {
-                                      return ctas_per_sm_35(schedule) * kMinSupportedSmCount;
-                                  }),
-              "a 35B cooperative route exceeds the sm_86 resident-CTA budget at its upper bound "
-              "on the smallest supported device");
-
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
@@ -178,11 +73,11 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+    case Bf16GdnGatingScheduleId::MmaSplit32:
+    case Bf16GdnGatingScheduleId::MmaSplit16:
+    case Bf16GdnGatingScheduleId::MmaSplit8:
+    case Bf16GdnGatingScheduleId::MmaSplit4:
+    case Bf16GdnGatingScheduleId::MmaSplit2:
     case Bf16GdnGatingScheduleId::MmaUnsplit:
         return true;
     case Bf16GdnGatingScheduleId::GemvPairedRows:
@@ -202,15 +97,15 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return 10;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+    case Bf16GdnGatingScheduleId::MmaSplit32:
         return 32;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+    case Bf16GdnGatingScheduleId::MmaSplit16:
         return 16;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+    case Bf16GdnGatingScheduleId::MmaSplit8:
         return 8;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+    case Bf16GdnGatingScheduleId::MmaSplit4:
         return 4;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+    case Bf16GdnGatingScheduleId::MmaSplit2:
         return 2;
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
@@ -221,34 +116,8 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
-bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
-                                  std::int32_t tile_cols, std::int32_t row_tiles,
-                                  std::int32_t resident_ctas) noexcept {
-    const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
-    const std::int64_t grid_ctas =
-        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
-    return grid_ctas <= resident_ctas;
-}
-
-bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
-    // sm_86, 65,536 regs/SM, 100 KiB smem/SM. BN128 uses 40 KiB of dynamic shared memory, capping
-    // every specialization at two CTAs/SM by shared memory alone. Measured on the sm_86 build
-    // (cuobjdump -res-usage): split8 uses 65 registers with 256 threads and reaches that 2 CTAs/SM.
-    // split4/2 were rebuilt at 8 warps and now reach the same 2 CTAs/SM; ctas_per_sm_27 is uniform
-    // for that reason. There are three 16-row tiles per token tile. The device-wide budget is this
-    // per-SM figure times the runtime SM count -- 82 on an RTX 3090, 84 on an RTX 3090 Ti.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, resident_ctas_27(schedule));
-}
-
-bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
-    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles, so shared memory alone
-    // admits four CTAs/SM. Measured on the sm_86 build (cuobjdump -res-usage): split32 uses
-    // 122-126 registers with 256 threads and is register bound to 2 CTAs/SM; split16 uses 56
-    // registers and reaches the shared-memory bound of 4 CTAs/SM; split8/4/2 use 74 registers and
-    // are register bound to 3 CTAs/SM. Multiply by the runtime SM count for the device-wide budget.
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas_35(schedule));
-}
-
+// Split-K reduction runs in a plain second kernel, so no schedule carries a grid-residency
+// constraint; legality is the family/schedule crossover table alone.
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
                         const Bf16GdnGatingProblem& problem) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
@@ -258,16 +127,15 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
             return problem.cols >= 2 && problem.cols <= 8;
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-            return cooperative_27_grid_is_resident(schedule, problem.cols);
+        case Bf16GdnGatingScheduleId::MmaSplit8:
+        case Bf16GdnGatingScheduleId::MmaSplit4:
+        case Bf16GdnGatingScheduleId::MmaSplit2:
         case Bf16GdnGatingScheduleId::MmaUnsplit:
             return true;
         case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         case Bf16GdnGatingScheduleId::SimtWarpRowC8:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+        case Bf16GdnGatingScheduleId::MmaSplit32:
+        case Bf16GdnGatingScheduleId::MmaSplit16:
             return false;
         }
     }
@@ -278,13 +146,12 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
         return problem.cols <= 8 * 65'535;
     case Bf16GdnGatingScheduleId::MmaUnsplit:
+    case Bf16GdnGatingScheduleId::MmaSplit32:
+    case Bf16GdnGatingScheduleId::MmaSplit16:
+    case Bf16GdnGatingScheduleId::MmaSplit8:
+    case Bf16GdnGatingScheduleId::MmaSplit4:
+    case Bf16GdnGatingScheduleId::MmaSplit2:
         return true;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        return cooperative_35_grid_is_resident(schedule, problem.cols);
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return false;
@@ -331,15 +198,15 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         bf16_gdn_gating_proj_35_simt_c8_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                                stream);
         return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+    case Bf16GdnGatingScheduleId::MmaSplit32:
         bf16_gdn_gating_proj_35_mma_split32_launch(plan.token_variant, x, a_weight, b_weight, A_log,
                                                    dt_bias, scratch.data, g, beta, stream);
         return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+    case Bf16GdnGatingScheduleId::MmaSplit16:
         bf16_gdn_gating_proj_35_mma_split16_launch(plan.token_variant, x, a_weight, b_weight, A_log,
                                                    dt_bias, scratch.data, g, beta, stream);
         return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+    case Bf16GdnGatingScheduleId::MmaSplit8:
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_split8_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
@@ -349,7 +216,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                    dt_bias, scratch.data, g, beta, stream);
         }
         return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+    case Bf16GdnGatingScheduleId::MmaSplit4:
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_split4_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
@@ -359,7 +226,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                    dt_bias, scratch.data, g, beta, stream);
         }
         return;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+    case Bf16GdnGatingScheduleId::MmaSplit2:
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_split2_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
@@ -388,10 +255,12 @@ std::size_t route_capacity(const std::array<RouteSpec, N>& routes, const Bf16Gdn
     std::size_t maximum = 0;
     for (const RouteSpec& route : routes) {
         if (route.cols.last < min_cols || route.cols.first > max_cols) { continue; }
-        const std::int32_t endpoint = std::min(route.cols.last, max_cols);
-        maximum                     = std::max(
+        const std::int32_t upper = std::min(route.cols.last, max_cols);
+        // Within one route the schedule is constant and the split workspace grows with cols, so
+        // the interval maximum sits at the upper endpoint.
+        maximum = std::max(
             maximum,
-            bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, endpoint}).workspace_bytes);
+            bf16_gdn_gating_resolve_plan({base.heads, base.input_rows, upper}).workspace_bytes);
     }
     return maximum;
 }
@@ -408,16 +277,16 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
         return "gdn_gating_proj.bf16.simt.warp_row.c4";
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
         return "gdn_gating_proj.bf16.simt.warp_row.c8";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        return "gdn_gating_proj.bf16.mma.cooperative_split32";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        return "gdn_gating_proj.bf16.mma.cooperative_split16";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        return "gdn_gating_proj.bf16.mma.cooperative_split8";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        return "gdn_gating_proj.bf16.mma.cooperative_split4";
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        return "gdn_gating_proj.bf16.mma.cooperative_split2";
+    case Bf16GdnGatingScheduleId::MmaSplit32:
+        return "gdn_gating_proj.bf16.mma.split32";
+    case Bf16GdnGatingScheduleId::MmaSplit16:
+        return "gdn_gating_proj.bf16.mma.split16";
+    case Bf16GdnGatingScheduleId::MmaSplit8:
+        return "gdn_gating_proj.bf16.mma.split8";
+    case Bf16GdnGatingScheduleId::MmaSplit4:
+        return "gdn_gating_proj.bf16.mma.split4";
+    case Bf16GdnGatingScheduleId::MmaSplit2:
+        return "gdn_gating_proj.bf16.mma.split2";
     case Bf16GdnGatingScheduleId::MmaUnsplit:
         return "gdn_gating_proj.bf16.mma.unsplit";
     }
@@ -428,8 +297,8 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
     switch (schedule) {
     case Bf16GdnNormGatingScheduleId::Composed:
         return "gdn_norm_gating_proj.bf16.composed";
-    case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
-        return "gdn_norm_gating_proj.bf16.mma.cooperative_split32";
+    case Bf16GdnNormGatingScheduleId::MmaSplit32:
+        return "gdn_norm_gating_proj.bf16.mma.split32";
     }
     return "gdn_norm_gating_proj.bf16.unknown";
 }
@@ -492,10 +361,11 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
+    // The fused split32 control path is gated by the T<=16 cap alone; no residency constraint
+    // applies since the split-K reduction moved to a plain second kernel.
     if (is_35(problem) && problem.cols <= 16) {
-        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
-        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
+        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaSplit32, problem);
+        schedule = Bf16GdnNormGatingScheduleId::MmaSplit32;
         norm_splits = 32;
     }
     const std::size_t norm_partial_bytes =

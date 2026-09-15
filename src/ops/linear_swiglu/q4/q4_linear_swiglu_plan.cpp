@@ -29,7 +29,11 @@ struct RouteSpec {
     Q4LinearSwiGluScheduleId schedule;
 };
 
-constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
+// Full 27B MLP shape and its two-rank tensor-parallel N-split (halved gate/up blocks).
+constexpr std::array<Q4LinearSwiGluProblem, 2> kShapes{{
+    {34816, 17408, 5120, 5120, 1},
+    {17408, 8704, 5120, 5120, 1},
+}};
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
@@ -57,9 +61,14 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == kShape.gate_up_rows &&
-           problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
-           problem.padded_k == kShape.padded_k;
+    for (const Q4LinearSwiGluProblem& shape : kShapes) {
+        if (problem.gate_up_rows == shape.gate_up_rows &&
+            problem.output_rows == shape.output_rows && problem.k == shape.k &&
+            problem.padded_k == shape.padded_k) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <class Allocator>

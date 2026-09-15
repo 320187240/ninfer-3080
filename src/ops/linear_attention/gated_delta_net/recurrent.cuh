@@ -487,6 +487,8 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+// Two-rank tensor-parallel N-split of the 48-layer layout: half the K/V heads and conv channels.
+using FoldGeometry48x24Tp = FoldGeometry<48, 8, 24, 5120>;
 
 template <class Geometry>
 struct FoldAccess {

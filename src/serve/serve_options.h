@@ -41,7 +41,11 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
+    bool tp                 = false; // two-rank tensor-parallel mode across devices {0,1}
     bool allow_prefix_reuse = true;
+    bool tp_prefix_reuse    = true; // --no-tp-prefix-reuse: opt out of prefix reuse in TP mode
+    ninfer::TpClockHolderMode tp_clock_holder = ninfer::TpClockHolderMode::Demand;
+    std::uint32_t tp_clock_holder_hold_ms      = 10'000; // --clock-holder-hold-ms (demand mode)
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;

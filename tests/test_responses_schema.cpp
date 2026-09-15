@@ -38,6 +38,7 @@ ninfer::PromptCapabilities effort_capabilities() {
     capabilities.enable_thinking                 = true;
     capabilities.reasoning_effort.low            = true;
     capabilities.reasoning_effort.medium         = true;
+    capabilities.reasoning_effort.high           = true;
     capabilities.reasoning_effort.xhigh          = true;
     capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
     return capabilities;
@@ -162,11 +163,11 @@ int test_reasoning_effort() {
     Json high                            = base;
     high["reasoning"]                    = Json{{"effort", "high"}};
     const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Responses high effort bypassed template capability validation");
+    const ResolvedPromptSemantics high_semantics =
+        resolve_prompt_semantics(high_request, ServeOptions{}, effort_capabilities());
+    failures += check(high_semantics.enable_thinking &&
+                          high_semantics.reasoning_effort == ninfer::ReasoningEffort::High,
+                      "Responses high effort did not resolve through template capabilities");
 
     Json invalid         = base;
     invalid["reasoning"] = Json{{"effort", "ultra"}};

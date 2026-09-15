@@ -24,6 +24,7 @@ struct DeviceMaterialization {
     std::uint64_t offset    = 0;
     std::uint64_t bytes     = 0;
     std::uint64_t alignment = 0;
+    TensorSlice slice;
 };
 
 struct HostMaterialization {
@@ -50,6 +51,7 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    void materialize_on_device(ObjectHandle handle, TensorSlice slice);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();

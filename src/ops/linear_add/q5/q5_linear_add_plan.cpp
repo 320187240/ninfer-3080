@@ -31,9 +31,12 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    // Two-rank tensor-parallel K-splits of the two shapes above.
+    {5120, 3072, 3072},
+    {5120, 8704, 8704},
 }};
 
 constexpr std::array<RouteSpec, 6> kK6144Routes{{
@@ -54,6 +57,16 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
+// The K=8704 rank shard is not a multiple of the direct kernels' 1024-element slab
+// (GEMV tile of 16 groups, split2 slab), so it routes through the runtime-K MMA family at
+// every column count.
+constexpr std::array<RouteSpec, 4> kK8704Routes{{
+    {{1, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+    {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
+    {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
     std::int64_t expected = 1;
@@ -65,7 +78,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kK8704Routes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
@@ -113,7 +127,9 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    if (problem.k == 6144) { return resolve_from(kK6144Routes); }
+    if (problem.k == 17408) { return resolve_from(kK17408Routes); }
+    return resolve_from(kK8704Routes);
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,

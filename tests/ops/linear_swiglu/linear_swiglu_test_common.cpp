@@ -211,8 +211,10 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 }
 
 void validate_profile(const Profile& profile) {
-    const bool q4 = profile.qtype == QType::Q4G64_F16S && profile.gate_up_rows == 34816 &&
-                    profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool q4 = profile.qtype == QType::Q4G64_F16S && profile.input_rows == 5120 &&
+                    ((profile.gate_up_rows == 34816 && profile.output_rows == 17408) ||
+                     // Two-rank tensor-parallel N-split of the 27B MLP gate/up blocks.
+                     (profile.gate_up_rows == 17408 && profile.output_rows == 8704));
     const bool w8 = profile.qtype == QType::W8G32_F16S && profile.gate_up_rows == 12288 &&
                     profile.input_rows == 2048 && profile.output_rows == 6144;
     const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&

@@ -25,32 +25,33 @@ __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
 
 __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bfloat16* q,
                                          __nv_bfloat16* k, __nv_bfloat16* gate, __nv_bfloat16* v,
-                                         std::int32_t tokens) {
+                                         std::int32_t tokens, std::int32_t rows,
+                                         std::int32_t q_rows, std::int32_t kv_rows) {
     const std::int64_t idx = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-    const std::int64_t n   = static_cast<std::int64_t>(kMtpAttnRows) * tokens;
+    const std::int64_t n   = static_cast<std::int64_t>(rows) * tokens;
     if (idx >= n) { return; }
 
-    const int row             = static_cast<int>(idx % kMtpAttnRows);
-    const int token           = static_cast<int>(idx / kMtpAttnRows);
+    const int row             = static_cast<int>(idx % rows);
+    const int token           = static_cast<int>(idx / rows);
     const __nv_bfloat16 value = attn_in[idx];
 
-    if (row < kMtpQRows) {
-        q[static_cast<std::int64_t>(token) * kMtpQRows + row] = value;
+    if (row < q_rows) {
+        q[static_cast<std::int64_t>(token) * q_rows + row] = value;
         return;
     }
-    if (row < kMtpQRows + kMtpKvRows) {
-        const int local                                          = row - kMtpQRows;
-        k[static_cast<std::int64_t>(token) * kMtpKvRows + local] = value;
+    if (row < q_rows + kv_rows) {
+        const int local                                      = row - q_rows;
+        k[static_cast<std::int64_t>(token) * kv_rows + local] = value;
         return;
     }
-    if (row < kMtpQRows + kMtpKvRows + kMtpQRows) {
-        const int local                                            = row - kMtpQRows - kMtpKvRows;
-        gate[static_cast<std::int64_t>(token) * kMtpQRows + local] = value;
+    if (row < 2 * q_rows + kv_rows) {
+        const int local                                        = row - q_rows - kv_rows;
+        gate[static_cast<std::int64_t>(token) * q_rows + local] = value;
         return;
     }
 
-    const int local = row - kMtpQRows - kMtpKvRows - kMtpQRows;
-    v[static_cast<std::int64_t>(token) * kMtpKvRows + local] = value;
+    const int local = row - 2 * q_rows - kv_rows;
+    v[static_cast<std::int64_t>(token) * kv_rows + local] = value;
 }
 
 } // namespace ninfer::ops

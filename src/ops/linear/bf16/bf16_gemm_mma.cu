@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_launch.h"
 
 #include "core/device.h"
+#include "ops/launcher/smem_attr.h"
 #include "ops/common/math.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_gemm_mma_config.h"
@@ -24,10 +25,9 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
                                          Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attr = cudaFuncSetAttribute(
+        set_max_dynamic_smem_per_device(
             bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16MmaContiguousOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attr);
+            Schedule::kSharedBytes);
     }
     bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(

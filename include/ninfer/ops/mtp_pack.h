@@ -33,11 +33,14 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
  * Op: mtp_split_attn_in
  *
  * Math / indexing:
- *   For each token, rows [0,6144), [6144,7168), [7168,13312), and [13312,14336) are copied to
- *   flattened Q[6144], K[1024], Gate[6144], and V[1024], respectively.
+ *   For each token, the packed rows are copied to flattened Q[q_rows], K[kv_rows],
+ *   Gate[q_rows], and V[kv_rows] in that order, the geometry derived from the concrete
+ *   output shapes. Registered domains: [q 6144 | k 1024 | gate 6144 | v 1024] for the full
+ *   27B projection and [3072 | 512 | 3072 | 512] for the two-rank TP shard halves.
  *
  * Logical shapes:
- *   attn_in [14336,T]; q/gate [256,24,T]; k/v [256,4,T], all contiguous BF16.
+ *   attn_in [2*(q_rows+kv_rows),T]; q/gate [256,24,T] and k/v [256,4,T] full-width, or
+ *   q/gate [256,12,T] and k/v [256,2,T] per rank, all contiguous BF16.
  *
  * Numeric:
  *   Exact BF16 element copies with only an index remap.

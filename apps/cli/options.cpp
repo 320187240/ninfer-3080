@@ -67,6 +67,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
+    if (text == "high") { return ReasoningEffort::High; }
     if (text == "xhigh") { return ReasoningEffort::XHigh; }
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
 }
@@ -84,8 +85,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--reasoning-effort low|medium|high|xhigh] [--vision]\n"
+           "       [--no-cuda-graph] [--tp] [--clock-holder-mode demand|always|off]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -148,6 +149,20 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--tp") {
+            options.tp = true;
+        } else if (arg == "--clock-holder-mode") {
+            const std::string mode = value(arg);
+            if (mode == "demand") {
+                options.clock_holder_mode = TpClockHolderMode::Demand;
+            } else if (mode == "always") {
+                options.clock_holder_mode = TpClockHolderMode::Always;
+            } else if (mode == "off") {
+                options.clock_holder_mode = TpClockHolderMode::Off;
+            } else {
+                throw std::invalid_argument(
+                    "--clock-holder-mode must be demand, always, or off (got '" + mode + "')");
+            }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {

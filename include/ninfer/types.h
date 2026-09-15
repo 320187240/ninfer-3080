@@ -68,6 +68,13 @@ struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
 
+// Per-rank TP clock-holder behaviour (see TpProgram for the measured rationale).
+enum class TpClockHolderMode : std::uint8_t {
+    Demand,
+    Always,
+    Off,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
@@ -82,6 +89,23 @@ struct EngineOptions {
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     LoadProgress load_progress;
+
+    // Two-rank tensor-parallel mode: rank r materializes only its shard of the weights into
+    // tp_devices[r]'s arena, and the TpProgram coordinator runs prefill/decode across both
+    // devices (greedy-only, same bounded 1-8 concurrency as the single-GPU path). When tp is
+    // false these fields are ignored and behavior is unchanged.
+    bool tp                    = false;
+    std::vector<int> tp_devices = {0, 1};
+    // Per-rank clock-holder threads keep WDDM from parking a gate-idle rank's SM clocks.
+    // Demand (default) pulses only while engine ops are recent, so an idle server parks its
+    // clocks; real agentic sessions decode measurably slower with the holder fully off
+    // (~/ninfer.jsonl: median 59.2 tok/s). Always keeps the original behaviour. See TpProgram.
+    TpClockHolderMode tp_clock_holder = TpClockHolderMode::Demand;
+    // Demand-mode grace: how long the pulses continue after the last engine op. Derived
+    // from a real agent session's inter-request gaps (n=362): 500 ms covered only 42% of
+    // gaps (holder expired before the next request, decode ran on parked clocks), 10 s
+    // covers 93%; minutes-scale pauses still park. Ignored unless the mode is Demand.
+    std::uint32_t tp_clock_holder_hold_ms = 10'000;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -154,6 +178,9 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    // Opt-in gate for compatible-prefix reuse in two-GPU tensor-parallel mode. Single-GPU
+    // engines ignore it; TP engines additionally require allow_prefix_reuse.
+    bool tp_prefix_reuse = false;
 };
 
 struct OutputOptions {
@@ -230,12 +257,14 @@ struct ChatMessage {
 enum class ReasoningEffort : std::uint8_t {
     Low,
     Medium,
+    High,
     XHigh,
 };
 
 struct ReasoningEffortCapabilities {
     bool low    = false;
     bool medium = false;
+    bool high   = false;
     bool xhigh  = false;
     std::optional<ReasoningEffort> default_effort;
 
@@ -245,6 +274,8 @@ struct ReasoningEffortCapabilities {
             return low;
         case ReasoningEffort::Medium:
             return medium;
+        case ReasoningEffort::High:
+            return high;
         case ReasoningEffort::XHigh:
             return xhigh;
         }
@@ -373,6 +404,9 @@ struct ArenaMemorySummary {
 
 struct MemorySummary {
     int device                                = 0;
+    // Actual tensor-parallel rank devices (one entry per rank). Empty in single-GPU mode,
+    // where `device` names the executor.
+    std::vector<int> tp_devices;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.

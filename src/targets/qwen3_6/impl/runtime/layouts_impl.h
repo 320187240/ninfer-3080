@@ -273,6 +273,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                std::int32_t max_width) {
         auto stage = layout.scope();
         (void)workspace_recipe::gdn_control<TextConfig>(layout, last);
+        if (Variant::gdn_control_full_width_heads > TextConfig::gdn_value_heads) {
+            // The TP rank's control staging: the full-width g/beta projection outputs and the
+            // contiguous rank halves gdn_mix extracts from them stay live across the GDN core.
+            matrix(layout, DType::FP32, Variant::gdn_control_full_width_heads, last);
+            matrix(layout, DType::FP32, Variant::gdn_control_full_width_heads, last);
+            matrix(layout, DType::FP32, TextConfig::gdn_value_heads, last);
+            matrix(layout, DType::FP32, TextConfig::gdn_value_heads, last);
+        }
         scratch(layout, Variant::gdn_norm_control_projection_workspace_capacity_bytes(first, last));
         (void)workspace_recipe::gdn_projection<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Snapshot) {
@@ -624,6 +632,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
+    impl->defer_graph_capture = inputs.defer_graph_capture;
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;

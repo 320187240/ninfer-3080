@@ -276,6 +276,19 @@ workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained 
 capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
 state 始终重新创建。
 
+Request 取消（client 断连、handle 弃置或 queue deadline）与正常 terminal 使用同一 retain 语义：boundary
+上一切已 commit 的 licensed state（`text_kv_valid` watermark 及对应的 KV 页、ledger/prefix identity、
+linear state）按 watermark 保留为 retained prefix，watermark 之后的未提交候选列被丢弃——与 partial
+terminal commit 的 trim 相同。因此客户端超时重发同一 prompt 时，重试从已完成的 prefill chunk watermark
+append 续传，而不是 full-reset 重 prefill；decode 轮中途取消的行同样按 watermark 保留（批级 GDN
+fold 已把该行线性状态回卷到轮基）。Backend watermark 覆盖不住 text watermark、identity 截断会
+切开 Vision item、或 GDN fold 无法回卷时，退化为丢弃式清理（lane 仅不可复用，不会不正确）。
+对更短 prompt 的精确重发（resident 序列已生成超过该 prompt）不做截断 append——GDN slot 与 tail
+hidden 都停在 resident frontier，截断会读到错位的线性注意力状态；短于 frontier 的复用只走 turn
+checkpoint。Admission
+偏好无 retained state 的干净 lane；被迫驱逐 retained lane 时，请求复用不到的 retained prefix 先于可复用
+的驱逐。
+
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 turn-checkpoint
 checkpoint；一份 slot 同时选择全部 GDN layers 的 convolution history 和 recurrent state。Decode round

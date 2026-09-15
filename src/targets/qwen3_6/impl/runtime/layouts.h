@@ -73,7 +73,11 @@ struct SequencePlanningInputs {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
-    int device          = 0;
+    // Two-rank TP: graph preparation is deferred past construction so the coordinator can
+    // install the per-rank execution seams first (capture, code warm-up, and qualification
+    // launches all execute the TP schedule).
+    bool defer_graph_capture = false;
+    int device               = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -98,7 +102,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
-    int device          = 0;
+    // Set for two-rank TP: ProgramImplCore skips graph preparation in its constructor and
+    // the TpProgram coordinator runs prepare_program_graphs() on both ranks after the
+    // two-rank seams are installed.
+    bool defer_graph_capture = false;
+    int device               = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

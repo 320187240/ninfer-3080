@@ -116,6 +116,15 @@ const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
 }
 
+const char* clock_holder_mode_name(ninfer::TpClockHolderMode mode) {
+    switch (mode) {
+    case ninfer::TpClockHolderMode::Demand: return "demand";
+    case ninfer::TpClockHolderMode::Always: return "always";
+    case ninfer::TpClockHolderMode::Off: return "off";
+    }
+    return "unknown";
+}
+
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
     switch (path) {
     case ninfer::PrefixReusePath::FullReset:
@@ -400,9 +409,16 @@ std::string format_server_start_json(
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
+          {"tp_prefix_reuse", options.tp_prefix_reuse},
+          {"tp_clock_holder", clock_holder_mode_name(options.tp_clock_holder)},
+          {"tp_clock_holder_hold_ms", options.tp_clock_holder_hold_ms},
           {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
           {"speculative_draft_window", options.speculative.draft_tokens},
           {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
+    if (!memory.tp_devices.empty()) {
+        // Tensor-parallel execution spans these devices; options.device is not the executor.
+        record["engine"]["tp_devices"] = memory.tp_devices;
+    }
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},

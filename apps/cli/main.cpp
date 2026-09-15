@@ -12,6 +12,16 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
 
 namespace {
 
@@ -58,6 +68,16 @@ std::string format_bytes(std::uint64_t bytes) {
 
 std::string format_arena_used(const ninfer::ArenaMemorySummary& arena) {
     return format_bytes(arena.used_bytes) + " / " + format_bytes(arena.capacity_bytes);
+}
+
+std::string format_devices(const ninfer::MemorySummary& memory) {
+    if (memory.tp_devices.empty()) { return std::to_string(memory.device); }
+    std::string output;
+    for (const int rank_device : memory.tp_devices) {
+        if (!output.empty()) { output += '+'; }
+        output += std::to_string(rank_device);
+    }
+    return output;
 }
 
 std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
@@ -183,7 +203,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 
     const std::uint64_t reserved = static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
                                    memory.runtime_reservation_bytes;
-    print_metric("device", std::to_string(memory.device));
+    print_metric("device", format_devices(memory));
     print_metric("max context", std::to_string(memory.max_context));
     print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
     print_metric("KV capacity", std::to_string(memory.kv_capacity));
@@ -235,7 +255,40 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 
 } // namespace
 
+#ifdef _WIN32
+// The MSVC CRT delivers argv in the ANSI code page (GBK on Chinese Windows), which
+// corrupts non-ASCII prompts before the UTF-8 tokenizer sees them. Re-encode the wide
+// command line as UTF-8 before parsing options.
+std::pair<int, char**> utf8_command_line() {
+    static std::vector<std::string> storage;
+    static std::vector<char*> pointers;
+    int wide_argc = 0;
+    wchar_t** wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (wide_argv == nullptr) { return {0, nullptr}; }
+    for (int i = 0; i < wide_argc; ++i) {
+        const int bytes =
+            WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string arg(bytes > 0 ? static_cast<std::size_t>(bytes) : 1, '\0');
+        if (bytes > 0) {
+            WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, arg.data(), bytes, nullptr, nullptr);
+            arg.pop_back(); // trailing NUL
+        }
+        storage.push_back(std::move(arg));
+    }
+    LocalFree(wide_argv);
+    for (std::string& arg : storage) { pointers.push_back(arg.data()); }
+    return {static_cast<int>(pointers.size()), pointers.data()};
+}
+#endif
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    const auto [utf8_argc, utf8_argv] = utf8_command_line();
+    if (utf8_argv != nullptr) {
+        argc = utf8_argc;
+        argv = utf8_argv;
+    }
+#endif
     try {
         const ninfer::cli::Options cli = ninfer::cli::parse_options(argc, argv);
         if (cli.help_requested) {
@@ -270,6 +323,8 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.tp             = cli.tp;
+        engine_options.tp_clock_holder = cli.clock_holder_mode;
         engine_options.load_progress  = load_progress.callback();
 
         const auto load_started = Clock::now();

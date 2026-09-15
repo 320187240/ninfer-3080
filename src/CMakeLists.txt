@@ -20,6 +20,7 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/tp_link.cu
   core/dtype.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
@@ -70,6 +71,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
   ops/launcher/embed_gather.cu
+  ops/launcher/tp_embed_gather.cu
   ops/launcher/gdn_gating.cu
   ops/launcher/gelu.cu
   ops/launcher/bidirectional_gqa_attention.cu
@@ -209,6 +211,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
   ops/wrapper/embedding.cpp
+  ops/wrapper/tp_embedding.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
   ops/wrapper/gdn_input_proj.cpp
@@ -240,7 +243,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)(;(86|89))*$")
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})

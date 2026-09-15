@@ -25,7 +25,7 @@ written to stderr, so stdout can be redirected independently:
 ```
 
 Thinking is enabled by default. If the chat template embedded in the loaded artifact exposes
-reasoning effort, `--reasoning-effort low|medium|xhigh` selects it; omitting the option uses the
+reasoning effort, `--reasoning-effort low|medium|high|xhigh` selects it; omitting the option uses the
 template's default. An artifact whose template does not expose effort rejects the option. Add
 `--no-thinking` for direct-response prompt rendering; it cannot be combined with
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
@@ -144,7 +144,7 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
-| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
+| `--reasoning-effort low\|medium\|high\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |

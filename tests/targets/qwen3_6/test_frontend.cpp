@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -335,12 +336,6 @@ int test_official_chat_template() {
                               no_generation);
                       }),
                       "direct developer role was accepted by the model frontend");
-    failures +=
-        check(throws_invalid_argument([&] {
-                  (void)render_chat({chat_message("user", "hi"), chat_message("system", "late")},
-                                    no_generation);
-              }),
-              "late system role was accepted by the model frontend");
     failures += check(throws_invalid_argument([&] {
                           (void)render_chat({chat_message("system", "only")}, no_generation);
                       }),
@@ -354,10 +349,36 @@ int test_official_chat_template() {
     return failures;
 }
 
+int test_mid_conversation_system_render() {
+    int failures = 0;
+    fi::ChatRenderOptions no_generation;
+    no_generation.add_generation_prompt = false;
+    // A system turn after the first non-system message renders in place. Hoisting
+    // it into the leading block would change the start of the rendered prompt on
+    // every turn, which invalidates any prefix cache built on earlier requests.
+    failures += check(
+        render_chat_text({chat_message("user", "hello"), chat_message("system", "reminder")},
+                         no_generation) == "<|im_start|>user\nhello<|im_end|>\n"
+                                           "<|im_start|>system\nreminder<|im_end|>\n",
+        "mid-conversation system turn was not rendered in place");
+    failures += check(
+        render_chat_text({chat_message("system", "lead"), chat_message("user", "hello"),
+                          chat_message("system", "reminder"), chat_message("user", "next")},
+                         no_generation) == "<|im_start|>system\nlead<|im_end|>\n"
+                                           "<|im_start|>user\nhello<|im_end|>\n"
+                                           "<|im_start|>system\nreminder<|im_end|>\n"
+                                           "<|im_start|>user\nnext<|im_end|>\n",
+        "leading system merges while later system turns stay in place");
+    return failures;
+}
+
 int test_reasoning_effort_chat_template() {
     constexpr std::string_view low_instructions =
         "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly "
         "to the conclusion without unnecessary elaboration.";
+    constexpr std::string_view high_instructions =
+        "Reasoning effort is set to high. Please think the task through carefully, verify key "
+        "assumptions and steps, and keep the reasoning directed toward the final answer.";
     constexpr std::string_view xhigh_instructions =
         "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
         "assumptions, consider plausible alternatives, and prioritize correctness, consistency, "
@@ -371,11 +392,13 @@ int test_reasoning_effort_chat_template() {
                              !toggle_capabilities.reasoning_effort.default_effort &&
                              !toggle_capabilities.reasoning_effort.low &&
                              !toggle_capabilities.reasoning_effort.medium &&
+                             !toggle_capabilities.reasoning_effort.high &&
                              !toggle_capabilities.reasoning_effort.xhigh,
                          "thinking-toggle template advertised reasoning effort");
     failures += check(
         effort_capabilities.enable_thinking && effort_capabilities.reasoning_effort.low &&
             effort_capabilities.reasoning_effort.medium &&
+            effort_capabilities.reasoning_effort.high &&
             effort_capabilities.reasoning_effort.xhigh &&
             effort_capabilities.reasoning_effort.default_effort == ninfer::ReasoningEffort::XHigh,
         "reasoning-effort template did not advertise its complete capability set");
@@ -396,6 +419,10 @@ int test_reasoning_effort_chat_template() {
               "low reasoning effort did not render the official instruction");
     failures += check(render_effort(ninfer::ReasoningEffort::Medium) == tail,
                       "medium reasoning effort injected an instruction");
+    failures +=
+        check(render_effort(ninfer::ReasoningEffort::High) ==
+                  "<|im_start|>system\n" + std::string(high_instructions) + "<|im_end|>\n" + tail,
+              "high reasoning effort did not render the official instruction");
 
     fi::ChatRenderOptions disabled;
     disabled.enable_thinking = false;
@@ -805,21 +832,27 @@ int test_disabled_vision() {
 } // namespace
 
 int main() {
-    const FrontendResources owned = resources();
-    const Frontend frontend       = FrontendFactory::create_component(owned);
-    int failures                  = 0;
-    failures += test_official_tokenizer_merge();
-    failures += test_official_chat_template();
-    failures += test_reasoning_effort_chat_template();
-    failures += test_turn_rewrite_trace();
-    failures += test_official_resource_guards();
-    failures += test_text_and_image_prepare(frontend);
-    failures += test_video_prepare(frontend);
-    failures += test_cross_round_stop(frontend);
-    failures += test_same_token_stop_priority(frontend);
-    failures += test_terminal_flush(frontend);
-    failures += test_reasoning_split(frontend);
-    failures += test_utf8_and_hidden_eos(frontend);
-    failures += test_disabled_vision();
-    return failures == 0 ? 0 : 1;
+    try {
+        const FrontendResources owned = resources();
+        const Frontend frontend       = FrontendFactory::create_component(owned);
+        int failures                  = 0;
+        failures += test_official_tokenizer_merge();
+        failures += test_official_chat_template();
+        failures += test_mid_conversation_system_render();
+        failures += test_reasoning_effort_chat_template();
+        failures += test_turn_rewrite_trace();
+        failures += test_official_resource_guards();
+        failures += test_text_and_image_prepare(frontend);
+        failures += test_video_prepare(frontend);
+        failures += test_cross_round_stop(frontend);
+        failures += test_same_token_stop_priority(frontend);
+        failures += test_terminal_flush(frontend);
+        failures += test_reasoning_split(frontend);
+        failures += test_utf8_and_hidden_eos(frontend);
+        failures += test_disabled_vision();
+        return failures == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "unexpected exception: " << error.what() << '\n';
+        return 1;
+    }
 }

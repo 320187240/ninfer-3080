@@ -282,6 +282,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache             = options_.kv_cache;
     engine_options.enable_vision        = options_.enable_vision;
     engine_options.use_cuda_graph       = options_.use_cuda_graph;
+    engine_options.tp                   = options_.tp;
+    engine_options.tp_clock_holder      = options_.tp_clock_holder;
+    engine_options.tp_clock_holder_hold_ms = options_.tp_clock_holder_hold_ms;
     engine_options.speculative          = options_.speculative;
     engine_options.load_progress        = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
@@ -507,6 +510,11 @@ void GenerationService::warmup() {
         request.messages.push_back(std::move(turn));
         request.max_tokens       = 4;
         request.max_tokens_set   = true;
+        if (options_.tp) {
+            // TP execution is greedy-only; the synthetic warmup request must match or the
+            // engine rejects it before the warm paths run.
+            request.sampling.temperature = 0.0;
+        }
         PreparedRequest prepared = prepare(request);
         run(prepared, nullptr);
     } catch (const std::exception& exception) {

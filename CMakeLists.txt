@@ -6,10 +6,10 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)(;(86|89))*$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=86 or 89; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES as a list of 86 and/or 89 "
+    "(e.g. 86, 89, or '86;89'); got '${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)

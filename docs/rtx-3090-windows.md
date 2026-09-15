@@ -85,10 +85,10 @@ bounded pending queue and join at a safe round boundary when a lane and memory a
 is more predictable than unrestricted dynamic batching because maximum VRAM, workspace, and CUDA
 Graph shapes are reserved in advance.
 
-Qwen3.8 supports `low`, `medium`, and `xhigh` reasoning effort. For Chat Completions add the
+Qwen3.8 supports `low`, `medium`, `high`, and `xhigh` reasoning effort. For Chat Completions add the
 top-level field `"reasoning_effort": "xhigh"`; Responses uses
 `"reasoning": {"effort": "xhigh"}`. The CLI accepts
-`--reasoning-effort low|medium|xhigh`.
+`--reasoning-effort low|medium|high|xhigh`.
 
 The paged cache supports BF16, INT8, and experimental opt-in `rk8v4` storage. INT8 remains the
 recommended default. On the development RTX 3090, `rk8v4` raised the measured C1 automatic-sizing

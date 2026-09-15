@@ -8,6 +8,7 @@
 #include "core/weight.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
+#include "targets/qwen3_6/impl/runtime/tp_exec.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <array>
@@ -93,7 +94,8 @@ class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                          WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient,
+                         TpExec* tp = nullptr);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
     [[nodiscard]] bool release_consumed_media_payload() noexcept;
@@ -105,6 +107,7 @@ private:
     qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
+    TpExec* tp_                 = nullptr;
     VisionContext context_;
     std::optional<std::uint32_t> active_item_;
     std::uint32_t final_item_ = 0;

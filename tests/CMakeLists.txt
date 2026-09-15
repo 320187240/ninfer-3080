@@ -58,6 +58,9 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_media_decode_test
+  SOURCES test_media_decode.cpp
+  LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
@@ -81,6 +84,8 @@ ninfer_add_test(ninfer_state_store_test
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES test_gdn_replay_records.cpp
   LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_tp_link_test SOURCES core/test_tp_link.cpp)
+set_tests_properties(ninfer_tp_link_test PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
@@ -103,6 +108,11 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_tp_retention_test
+  SOURCES targets/qwen3_6/test_tp_retention.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_tp_retention_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -114,8 +124,36 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
-target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_tp_shard_test
+  SOURCES targets/qwen3_6_27b/test_tp_shard.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_6_27b_tp_shard_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_libraries(ninfer_qwen3_6_27b_tp_shard_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_tp_shard_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_tp_decode_test
+  SOURCES targets/qwen3_6_27b/test_tp_decode.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_tp_decode_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_tp_decode_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_tp_mtp_test
+  SOURCES targets/qwen3_6_27b/test_tp_mtp.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_tp_mtp_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_tp_mtp_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_tp_prefix_test
+  SOURCES targets/qwen3_6_27b/test_tp_prefix.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_tp_prefix_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_tp_prefix_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_tp_concurrent_test
+  SOURCES targets/qwen3_6_27b/test_tp_concurrent.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_6_27b_tp_concurrent_test PRIVATE ${NINFER_CUDART_TARGET})
+set_tests_properties(ninfer_qwen3_6_27b_tp_concurrent_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
@@ -131,7 +169,7 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
-target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 

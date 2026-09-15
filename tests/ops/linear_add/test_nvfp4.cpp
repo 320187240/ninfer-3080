@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <span>
 #include <string>
@@ -87,13 +88,15 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 }
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    [[maybe_unused]] const std::int32_t first_a4 = k == 6144 ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+#ifndef NINFER_SM8X_COMPAT
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
+#endif
     };
     constexpr std::int32_t kMaximumTokens = 1024;
     quantized_weight::PatternedWeightOptions options;
@@ -182,8 +185,13 @@ int main() {
         return 77;
     }
     int failures = 0;
-    failures += run_shape(5120, 6144, 811U);
-    failures += run_shape(5120, 17408, 821U);
+    try {
+        failures += run_shape(5120, 6144, 811U);
+        failures += run_shape(5120, 17408, 821U);
+    } catch (const std::exception& error) {
+        std::cerr << "unexpected exception: " << error.what() << '\n';
+        return 1;
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }
