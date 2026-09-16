@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build NInfer for a single RTX 3080 (sm_89, Ada).
+# Build NInfer for a single RTX 3080 (sm_86, Ampere).
 #
 # The repo's top-level CMakeLists.txt only accepts CMAKE_CUDA_ARCHITECTURES of
-# 86 and/or 89. For an RTX 3080 pass 89. The sm_120a nvfp4 TMA kernels are
+# 86 and/or 89. For an RTX 3080 pass 86. The sm_120a nvfp4 TMA kernels are
 # conditionally compiled out when the arch is not 120a, so no source changes
 # are needed to target the 3080.
 #
@@ -16,7 +16,7 @@ BUILD_DIR="${1:-build}"
 
 cmake -S . -B "${BUILD_DIR}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=89
+  -DCMAKE_CUDA_ARCHITECTURES=86
 
 cmake --build "${BUILD_DIR}" --config Release -j"$(nproc)"
 

@@ -1,45 +1,11 @@
-# Build NInfer for RTX 3090 on Linux
+# Build NInfer on Linux
 
-This guide builds the `sm_86` runtime for one NVIDIA GeForce RTX 3090 or RTX 3090 Ti.
-The project does not publish a qualified Linux binary release yet.
+This guide builds the `sm_86` runtime for one NVIDIA GeForce RTX 3080 (or RTX 3090 / 3090 Ti).
+The project does not publish a qualified Linux binary release; the production host builds natively
+and serves through a user systemd unit.
 
 Do not change `CMAKE_CUDA_ARCHITECTURES` to `89`.
-The RTX 4090 fork uses Ada-specific schedules that do not apply to the RTX 3090.
-
-## Container build
-
-The repository Dockerfile gives the shortest build path on Bazzite and other Linux distributions.
-It uses Ubuntu 24.04, CUDA 13.1, GCC 13, Ninja, FFmpeg, and curl.
-
-Install Docker and the NVIDIA Container Toolkit first.
-Then make sure that Docker can access the GPU:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:13.1.2-runtime-ubuntu24.04 nvidia-smi
-```
-
-Build the image from the repository root:
-
-```bash
-docker build --tag ninfer-3090:sm86 .
-```
-
-Run the Qwen3.8 server with a model directory from the host:
-
-```bash
-docker run --rm --gpus all \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/workspace/models:ro" \
-  ninfer-3090:sm86 \
-  ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --max-context 65536 --kv-capacity 65536 \
-  --max-concurrency 1 --max-pending-requests 16 \
-  --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
-The API is available at `http://127.0.0.1:8080/v1`.
+The RTX 4090 fork uses Ada-specific schedules that do not apply to sm_86 Ampere cards.
 
 ## Native Ubuntu 24.04 build
 
@@ -66,7 +32,7 @@ export CUDAHOSTCXX=/usr/bin/g++-13
 Configure and build the Linux applications:
 
 ```bash
-cmake -S . -B build-sm86 -G Ninja \
+cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$CC" \
   -DCMAKE_CXX_COMPILER="$CXX" \
@@ -77,14 +43,14 @@ cmake -S . -B build-sm86 -G Ninja \
   -DBUILD_TESTING=OFF \
   -DNINFER_BUILD_BENCHMARKS=OFF
 
-cmake --build build-sm86 --parallel 2
+cmake --build build --parallel 2
 ```
 
 The build creates these applications:
 
 ```text
-build-sm86/apps/ninfer
-build-sm86/apps/ninfer-serve
+build/apps/ninfer
+build/apps/ninfer-serve
 ```
 
 ## Optional vcpkg dependencies
@@ -107,42 +73,30 @@ Add these options to the native CMake command:
 
 ## Bash scripts
 
-The `scripts/` directory contains Bash versions of each Windows download, launcher, and packaging
-script. Download scripts save models under `scripts/models` by default:
+`scripts/` contains the local build and model-download helpers:
 
 ```bash
-./scripts/download-qwen38.sh
-./scripts/download-qwen36-35b-vision.sh
+./scripts/build-single-3080.sh   # cmake + ninja, sm_86 (RTX 3080 Ampere)
+./scripts/download-qwen38.sh     # fetch the Qwen3.8-27B .ninfer artifact
 ```
 
-Set `NINFER_MODEL_DIR` to use another model directory. Each launcher also accepts a model path:
-
-```bash
-./scripts/run-qwen38-c1.sh /path/to/qwen3_8_27b.ninfer
-./scripts/run-qwen38-c8.sh /path/to/qwen3_8_27b.ninfer
-./scripts/run-qwen38-vision.sh /path/to/qwen3_8_27b.ninfer
-./scripts/run-qwen36-35b-vision.sh /path/to/qwen3_6_35b_a3b.ninfer
-```
-
-The launchers use `build-sm86/apps/ninfer-serve` when the executable is not beside the script.
-Set `NINFER_SERVER` to select another executable.
-
-The `package-release-v*.sh` scripts create Linux `tar.gz` archives from their matching historical
-build directories. The PowerShell scripts continue to create Windows ZIP archives.
+Set `NINFER_MODEL_DIR` to use another model directory (default: `scripts/models`). The serving
+command lives in `~/.config/systemd/user/ninfer.service` on the production host; build output is
+`build/apps/ninfer-serve`.
 
 ## Validation
 
 Make sure that the applications start:
 
 ```bash
-./build-sm86/apps/ninfer --help
-./build-sm86/apps/ninfer-serve --help
+./build/apps/ninfer --help
+./build/apps/ninfer-serve --help
 ```
 
 Run one short generation with the real Qwen3.8 artifact:
 
 ```bash
-./build-sm86/apps/ninfer models/qwen3_8_27b.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Explain prefill and decode in two sentences." \
   --max-context 8192 --max-new 32 \
   --kv-dtype int8 \

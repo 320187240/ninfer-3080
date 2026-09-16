@@ -109,38 +109,12 @@ Release notes for this branch: [v0.6.1](RELEASE_NOTES_0.6.1.md).
 
 ## Choose a platform
 
-| Platform | Delivery | Guide |
-|---|---|---|
-| Linux | Docker image or native source build | [Linux build guide](docs/rtx-3090-linux.md) |
-| Windows 11 | Prebuilt release archive | [Windows guide](docs/rtx-3090-windows.md) |
+### Linux (RTX 3080, sm_86)
 
-### Linux
-
-The Dockerfile gives the shortest build path on Bazzite and other Linux distributions:
-
-```bash
-docker build --tag ninfer-3090:sm86 .
-```
-
-The Linux guide contains the GPU check, native Ubuntu build, model mount, server command, and Bash
-launchers. The project does not publish a prebuilt Linux archive or qualified Linux performance
-results yet.
-
-### Windows 11
-
-1. Download and unzip the latest [Windows release](https://github.com/Don-Chad/ninfer-3090/releases/latest).
-2. Double-click `download-qwen38.bat` to download the model. Interrupted downloads resume.
-3. Double-click one launcher:
-
-| Launcher | Best for |
-|---|---|
-| `run-qwen38-c1.bat` | One interactive user, lowest latency, up to 64K context |
-| `run-qwen38-c8.bat` | Multiple users or agents, highest aggregate throughput, 8K context |
-| `run-qwen38-vision.bat` | Qwen3.8 image understanding, one user, 32K context, MTP3 |
-| `run-qwen36-35b-vision.bat` | Image understanding with Qwen3.6-35B-A3B, one user, 32K context |
-
-The API is then available at `http://127.0.0.1:8080/v1`. The Windows archive includes the required
-applications and DLLs.
+The single-GPU path on this host is the production setup: build with `scripts/build-single-3080.sh`
+and run through the user service `~/.config/systemd/user/ninfer.service` (76,800-token context,
+rk8v4 KV, MTP3, single request). The Linux build guide covers the native Ubuntu build and model
+download (`scripts/download-qwen38.sh`, interrupted downloads resume).
 
 ## Qwen3.8-27B support and RTX 3090 results
 
@@ -220,7 +194,7 @@ validation; do not use it as the default for correctness-sensitive work.
 ### Qwen3.8 vision
 
 The same Qwen3.8 artifact supports images. Start the server with `--vision`, MTP3, INT8 KV, and a
-32K maximum context. The Windows archive includes `run-qwen38-vision.bat` for this profile.
+32K maximum context (or the production `ninfer.service` profile with `rk8v4` KV at 76,800 tokens).
 
 A 1,920×1,080 image expanded to 2,074 prompt tokens and was read correctly. Measured TTFT was
 3.29 seconds, decode reached 98.1 tok/s, MTP acceptance was 96.7%, and startup retained 2.16 GiB
@@ -250,8 +224,8 @@ reducing measured prefill from 371 ms to 10 ms.
 ### Qwen3.6-35B vision
 
 The compact 35B artifact includes its vision encoder and accepts images through the same OpenAI-
-compatible API. Start the server with `--vision` and leave speculative decoding disabled. The
-Windows archive includes `run-qwen36-35b-vision.bat` for this profile.
+compatible API. Start the server with `--vision` and leave speculative decoding disabled
+(`--no-spec` or omit `--spec`); the profile is one request, 32K maximum context, INT8 KV.
 
 The safe RTX 3090 profile is **one request, 32K maximum context, INT8 KV, vision enabled, and MTP
 disabled**. A current v0.6 test processed three 1,920×1,080 images correctly. Each image expanded
@@ -264,15 +238,12 @@ still use MTP3 as documented above.
 
 ## Capabilities
 
-- Native SM86 CLI and server applications for Linux and Windows.
-- A prebuilt Windows archive with tested launchers.
+- Native SM86 CLI and server applications for Linux.
 - OpenAI Chat Completions, Responses, and Anthropic-compatible APIs.
 - ReplaySSM and MTP3 for higher throughput without exceeding 24 GB VRAM.
 - `low`, `medium`, `high`, and `xhigh` reasoning modes.
 - Qwen3.8 image understanding with ReplaySSM and MTP3.
 - Prefix reuse for faster repeated or shared prompts.
-- Qwen3.6-35B image understanding with a guarded 32K profile.
-- Windows one-user and eight-user launchers with safe tested defaults.
 
 ## Supported artifacts
 
@@ -290,12 +261,11 @@ omits DFlash, providing the known 24 GB memory profile.
 
 ## Models and platform support
 
-Linux users build the applications from source or use the Docker image. Windows users can use the
-prebuilt archive, which includes the applications and required DLLs. Both platforms require an
-RTX 3090 or RTX 3090 Ti and a recent NVIDIA driver.
+Linux users build the applications from source. This fork targets RTX 3080 (sm_86) and a recent
+NVIDIA driver.
 
 Download the [official Qwen3.8 artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) as
-`models/qwen3_8_27b.ninfer`. Windows users can run `download-qwen38.bat` instead.
+`models/qwen3_8_27b.ninfer`, or run `scripts/download-qwen38.sh` (interrupted downloads resume).
 
 For Qwen3.6-35B-A3B, the smaller
 [pinned container-v1 artifact](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/tree/c8b8c1c0df4c74df3c190c6aa3a7f24dc614721c)
