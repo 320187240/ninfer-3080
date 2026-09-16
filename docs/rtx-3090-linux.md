@@ -1,8 +1,8 @@
-# Build NInfer on Linux
+# Build NInfer on Linux (RTX 3080, sm_86)
 
-This guide builds the `sm_86` runtime for one NVIDIA GeForce RTX 3080 (or RTX 3090 / 3090 Ti).
-The project does not publish a qualified Linux binary release; the production host builds natively
-and serves through a user systemd unit.
+This guide builds the `sm_86` runtime for one NVIDIA GeForce RTX 3080 20 GB (Ampere).
+The project does not publish a qualified Linux binary release; the production host builds
+natively and serves through a user systemd unit.
 
 Do not change `CMAKE_CUDA_ARCHITECTURES` to `89`.
 The RTX 4090 fork uses Ada-specific schedules that do not apply to sm_86 Ampere cards.
@@ -80,9 +80,45 @@ Add these options to the native CMake command:
 ./scripts/download-qwen38.sh     # fetch the Qwen3.8-27B .ninfer artifact
 ```
 
-Set `NINFER_MODEL_DIR` to use another model directory (default: `scripts/models`). The serving
-command lives in `~/.config/systemd/user/ninfer.service` on the production host; build output is
-`build/apps/ninfer-serve`.
+Set `NINFER_MODEL_DIR` to use another model directory (default: `scripts/models`). The production
+host keeps the model at `models/qwen3_8_27b.ninfer` and serves it through the user unit
+`~/.config/systemd/user/ninfer.service`; build output is `build/apps/ninfer-serve`.
+
+## Deploying the user systemd unit
+
+A minimal production unit (single GPU, 76,800-token `rk8v4` context, MTP3):
+
+```ini
+# ~/.config/systemd/user/ninfer.service
+[Unit]
+Description=NInfer Qwen3.8-27B Inference Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/ninfer-3080
+ExecStart=/path/to/ninfer-3080/build/apps/ninfer-serve /path/to/ninfer-3080/models/qwen3_8_27b.ninfer --host 127.0.0.1 --port 8080 --api-key <your key> --max-context 76800 --kv-capacity 76800 --kv-dtype rk8v4 --max-concurrency 1 --spec mtp --draft-tokens 3 --lm-head-draft --no-thinking
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Enable it for boot (requires `loginctl enable-linger $USER` so user units start without a
+login session):
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ninfer.service
+journalctl --user -u ninfer.service -n 50 --no-pager
+```
+
+Check the server answers:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models -H "Authorization: Bearer <your key>"
+```
 
 ## Validation
 

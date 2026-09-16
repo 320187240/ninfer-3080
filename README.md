@@ -1,26 +1,53 @@
-# NInfer-3080duo
+# NInfer-3080
 
-NInfer-3080duo is a fork of the NInfer-3090 C++20/CUDA inference engine that runs **Qwen3.8-27B
-tensor-parallel across two consumer GPUs in one Windows process** (developed on
-3080 20 GB + 4080 16 GB, now running on 2× RTX 3080 20 GB). The 16.96 GiB groupwise
-`.ninfer` artifact is split along group-safe axes to ~8.4 GiB of weights per rank,
-per-rank CUDA Graphs execute the decode rounds, and a mapped-pinned spin transport
-(`TpLink`) carries the ~150 allreduce/argmax exchanges per round. Neither card can hold
-the model alone; together they serve the full OpenAI/Anthropic surface with a
-**262,144-token INT8 context**.
+This is a fork of the NInfer-3090 C++20/CUDA inference engine tuned to run **Qwen3.8-27B on a
+single consumer GPU** — the production host is one NVIDIA GeForce RTX 3080 20 GB (Ampere,
+`sm_86`) under Linux. The 16.96 GiB groupwise `.ninfer` artifact loads whole on the one card
+with paged KV, prefix reuse, CUDA Graphs, and MTP3 speculative decoding via ReplaySSM.
 
-Inherited single-GPU capabilities (paged KV, prefix reuse, CUDA Graphs, MTP speculative
-decoding, reasoning-effort control, ReplaySSM, bounded concurrency, vision) are unchanged
-and documented below. See [TP2 architecture](docs/maintainer/tp-architecture.md) for the
-split plan, transport measurements, and gate evidence.
+The production profile serves the full OpenAI/Anthropic API surface through a user systemd unit
+(`ninfer.service`): 76,800-token context, `rk8v4` KV, MTP3, one concurrent request, listening on
+127.0.0.1:8080.
+
+The inherited TP2 code (tensor-parallel across two consumer GPUs in one process, originally
+developed on 3080 20 GB + 4080 16 GB, qualified on 2× RTX 3080 20 GB) is retained: with `--tp`
+the 16.96 GiB model is split along group-safe axes to ~8.4 GiB of weights per rank, and neither
+card can hold it alone. In that mode the fork serves a **262,144-token INT8 context** (greedy
+only). See [TP2 architecture](docs/maintainer/tp-architecture.md) for the split plan, transport
+measurements, and gate evidence.
 
 Community project, maintained on a best-effort basis. Issues and PRs are very welcome, but support
 and feature requests are not guaranteed.
 
-## TP2 quick start
+## Quick start (single GPU, production profile)
 
-Both GPUs must be visible to CUDA (the engine addresses CUDA dev0/dev1 in order; on the
-current host both are RTX 3080 20 GB).
+Build once (`scripts/build-single-3080.sh`), fetch the model (`scripts/download-qwen38.sh`), then
+serve it. The systemd unit below is the production setup on the 3080 host; the same flags work
+in a plain shell.
+
+```ini
+# ~/.config/systemd/user/ninfer.service
+[Service]
+WorkingDirectory=/path/to/ninfer-3080
+ExecStart=/path/to/ninfer-3080/build/apps/ninfer-serve /path/to/ninfer-3080/models/qwen3_8_27b.ninfer --host 127.0.0.1 --port 8080 --api-key <your key> --max-context 76800 --kv-capacity 76800 --kv-dtype rk8v4 --max-concurrency 1 --spec mtp --draft-tokens 3 --lm-head-draft --no-thinking
+```
+
+One greedy generation inside the full 76,800-token context:
+
+```bash
+build/apps/ninfer models/qwen3_8_27b.ninfer --max-context 76800 --kv-capacity 76800 --kv-dtype rk8v4 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 128 --no-thinking --prompt "What is the boiling point of water at sea level? Answer in one sentence."
+```
+
+Chat API:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer <your key>" -H "Content-Type: application/json" -d \
+  '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"What is the boiling point of water at sea level?"}],"max_tokens":64,"temperature":0}'
+```
+
+## TP2 quick start (two GPUs)
+
+Both GPUs must be visible to CUDA (the engine addresses CUDA dev0/dev1 in order).
 `--tp` enables the two-rank path; it is greedy-only (requests with temperature > 0 are
 rejected with HTTP 503 and a clear message). `--tp --vision` enables image/video input: the
 vision tower runs on rank 0 and its embeddings are broadcast to rank 1 through the TpLink
@@ -30,28 +57,23 @@ exact shortfall; the 8192-token vision profile starts both ranks with ~5.3 GiB f
 
 CLI, one greedy generation inside the full 262K context:
 
-```bat
-ninfer.exe qwen3_8_27b.ninfer --tp --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 128 --no-thinking --prompt "What is the boiling point of water at sea level? Answer in one sentence."
+```bash
+build/apps/ninfer models/qwen3_8_27b.ninfer --tp --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 128 --no-thinking --prompt "What is the boiling point of water at sea level? Answer in one sentence."
 ```
 
 CLI, image understanding across both GPUs (`--messages` carries image parts exactly like the
 single-GPU vision profile):
 
-```bat
-ninfer.exe qwen3_8_27b.ninfer --tp --vision --max-context 8192 --kv-capacity 8192 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 64 --no-thinking --messages messages.json
+```bash
+build/apps/ninfer models/qwen3_8_27b.ninfer --tp --vision --max-context 8192 --kv-capacity 8192 --kv-dtype int8 --spec mtp --draft-tokens 3 --lm-head-draft --greedy --max-new 64 --no-thinking --messages messages.json
 ```
 
 Server with the same 262K profile (send `"temperature": 0` from clients, or add `--greedy`).
 TP serves the same bounded multi-request concurrency as single-GPU (`--max-concurrency 1-8`).
 Compatible-prefix reuse is on by default in TP mode; `--no-tp-prefix-reuse` opts out.
 
-```bat
-ninfer-serve.exe qwen3_8_27b.ninfer --tp --host 127.0.0.1 --port 8117 --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --max-concurrency 8 --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
 ```bash
-curl http://127.0.0.1:8117/v1/chat/completions -H "Content-Type: application/json" -d \
-  '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"What is the boiling point of water at sea level?"}],"max_tokens":64,"temperature":0}'
+build/apps/ninfer-serve models/qwen3_8_27b.ninfer --tp --host 127.0.0.1 --port 8117 --max-context 262144 --kv-capacity 262144 --kv-dtype int8 --max-concurrency 8 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 ## TP2 measured results (Qwen3.8-27B, 2× RTX 3080 20 GB)
@@ -91,8 +113,12 @@ nvidia-smi -i <rank 1 index> -lgc 1750,1750
 
 ---
 
-The sections below describe the inherited single-GPU NInfer-3090 behavior, measurements, and
-packaging; on this fork they apply to the non-`--tp` path on a single installed GPU.
+The sections below describe the inherited single-GPU NInfer-3090 behavior and measurements; on
+this fork they apply to the non-`--tp` path on a single installed GPU. Where a figure was measured
+on the upstream RTX 3090 host, it is labelled as such — the 3080 host differs in clock and VRAM
+controller behavior, so treat those numbers as upstream reference points rather than local
+expectations. The local production profile (76,800 tokens, `rk8v4`, C1) is the one that matters
+for this fork's single card.
 
 
 
@@ -166,11 +192,10 @@ the recommended quality setting. RotorQuant applies the same normalized transfor
 keys, rotates values before four-bit storage, and reverses the value transform after attention.
 This reduces the V-cache footprint while keeping keys at eight bits.
 
-Add `--kv-dtype rk8v4` to either `ninfer.exe` or `ninfer-serve.exe`. For example, from Command
-Prompt:
+Add `--kv-dtype rk8v4` to either `ninfer` or `ninfer-serve`. For example:
 
-```bat
-ninfer-serve.exe qwen3_8_27b.ninfer --max-context 131072 --kv-capacity auto --max-concurrency 1 --prefill-chunk 1024 --kv-dtype rk8v4 --spec mtp --draft-tokens 3 --lm-head-draft
+```bash
+build/apps/ninfer-serve models/qwen3_8_27b.ninfer --max-context 131072 --kv-capacity auto --max-concurrency 1 --prefill-chunk 1024 --kv-dtype rk8v4 --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 On the development RTX 3090, C1 with MTP and CUDA Graphs disabled fit a **226,560-token** logical
@@ -273,12 +298,11 @@ is recommended on a 24 GB card. Releases v0.5 and newer also read the larger con
 An `artifact magic is not NInfer version 1` message means the executable is outdated, not that the
 current model download is necessarily corrupt.
 
-Developers can build from source on Windows or Linux. Windows uses Visual Studio 2022 and vcpkg.
-Linux uses GCC 13 with system packages or the pinned vcpkg manifest. Both builds require CUDA 12.8
-or newer and CMake 3.28 or newer.
+Developers build from source on Linux. The build uses GCC 13 with system packages (FFmpeg, curl)
+or the pinned vcpkg manifest, and requires CUDA 12.8 or newer and CMake 3.28 or newer.
 
-See the [Windows build guide](docs/rtx-3090-windows.md) or the
-[Linux build guide](docs/rtx-3090-linux.md). Ordinary Windows release users do not need these tools.
+See the [Linux build guide](docs/rtx-3090-linux.md). The production host builds through
+`scripts/build-single-3080.sh` and serves through the user unit `~/.config/systemd/user/ninfer.service`.
 
 ## Qwen3.8 reasoning effort
 
@@ -353,18 +377,18 @@ a 24 GB card and the server can reuse fast CUDA Graphs instead of rebuilding wor
 
 ## Validation
 
-The v0.6.0 Windows gate covered Qwen3.8 generation, materialization, request memory, admission,
-paged KV, prefix reuse, speculative rounds, and SM86 W8 Linear paths.
-
-The v0.6.1 Linux source gate completed all 245 Docker compile and link steps with CUDA 13.1 on
+The v0.6.1 Linux source gate completed all 245 compile and link steps with CUDA 13.1 on
 Ubuntu 24.04. Both Linux applications returned their `--help` output with GPU access enabled.
-A real-artifact Linux generation and Linux performance qualification remain open.
+On this fork the gate is extended by production use: the 3080 host has run the real Qwen3.8
+artifact continuously through `ninfer.service`, and decode/quality behavior was re-verified
+against the upstream gates (token-identical greedy output, MTP acceptance, prefill/decode
+throughput recorded in [bench/](bench/README.md)).
 
 ## Upstream
 
 NInfer-3090 is derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). The upstream project
-targets RTX 5090/`sm_120a`; this fork carries the Windows and Linux SM86 compatibility layer,
-compact 35B artifact support, and RTX 3090-specific schedules and memory planning.
+targets RTX 5090/`sm_120a`; this fork carries the Linux SM86 compatibility layer, compact 35B
+artifact support, single-RTX-3080 schedules and memory planning, and the retained TP2 two-card path.
 
 ## Contributors
 
