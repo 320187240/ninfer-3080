@@ -426,6 +426,36 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     }
 }
 
+void parse_response_format(const Json& body, GenerationRequest& out) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) {
+        out.response_format.type = ResponseFormatType::Text;
+        return;
+    }
+    const Json& fmt = body.at("response_format");
+    if (!fmt.is_object()) {
+        bad_request("response_format must be an object", "response_format");
+    }
+    if (!fmt.contains("type") || !fmt.at("type").is_string()) {
+        bad_request("response_format must contain a string type", "response_format");
+    }
+    const std::string type = fmt.at("type").get<std::string>();
+    if (type == "text") {
+        out.response_format.type = ResponseFormatType::Text;
+    } else if (type == "json_object") {
+        out.response_format.type = ResponseFormatType::JsonObject;
+    } else if (type == "json_schema") {
+        out.response_format.type = ResponseFormatType::JsonSchema;
+        if (!fmt.contains("json_schema") || !fmt.at("json_schema").is_object()) {
+            bad_request("response_format type json_schema requires a json_schema object",
+                        "response_format");
+        }
+        out.response_format.json_schema = fmt.at("json_schema").dump();
+    } else {
+        bad_request("response_format type must be text, json_object, or json_schema",
+                    "response_format");
+    }
+}
+
 void reject_unsupported_features(const Json& body) {
     for (const char* key : {"functions", "function_call"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
@@ -433,19 +463,6 @@ void reject_unsupported_features(const Json& body) {
             error.message = std::string(key) + " is not supported yet";
             error.param   = key;
             error.code    = "tools_not_supported";
-            throw ApiException(std::move(error));
-        }
-    }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
             throw ApiException(std::move(error));
         }
     }
@@ -542,6 +559,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_response_format(body, out);
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
@@ -675,18 +693,24 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-std::string make_models_list(const std::string& model_id, std::int64_t created) {
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t context_length) {
     const Json payload = {{"object", "list"},
                           {"data", Json::array({Json{{"id", model_id},
                                                      {"object", "model"},
                                                      {"created", created},
-                                                     {"owned_by", "ninfer"}}})}};
+                                                     {"owned_by", "ninfer"},
+                                                     {"context_length", context_length}}})}};
     return payload.dump();
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}};
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t context_length) {
+    const Json payload = {{"id", model_id},
+                          {"object", "model"},
+                          {"created", created},
+                          {"owned_by", "ninfer"},
+                          {"context_length", context_length}};
     return payload.dump();
 }
 
