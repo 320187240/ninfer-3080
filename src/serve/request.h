@@ -162,6 +162,17 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     return {};
 }
 
+enum class ResponseFormatType {
+    Text,
+    JsonObject,
+    JsonSchema,
+};
+
+struct ResponseFormat {
+    ResponseFormatType type = ResponseFormatType::Text;
+    std::string json_schema; // populated for JsonSchema
+};
+
 struct GenerationRequest {
     std::string model;
     std::vector<ChatTurn> messages;
@@ -178,6 +189,7 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    ResponseFormat response_format;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {
